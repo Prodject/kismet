@@ -27,6 +27,7 @@
 #include <memory>
 #include <vector>
 #include <kaitai/kaitaistream.h>
+#include "multi_constexpr.h"
 
 class dot11_ie_54_mobility {
 public:
@@ -36,19 +37,19 @@ public:
 
     void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-    uint16_t mobility_domain() {
+    constexpr17 uint16_t mobility_domain() const {
         return m_mobility_domain;
     }
 
-    uint8_t mobility_policy() {
+    constexpr17 uint8_t mobility_policy() const {
         return m_mobility_policy;
     }
 
-    unsigned int policy_fastbss_over_ds() {
+    constexpr17 unsigned int policy_fastbss_over_ds() const {
         return mobility_policy() & 0x01;
     }
 
-    unsigned int policy_resource_request_capability() {
+    constexpr17 unsigned int policy_resource_request_capability() const {
         return mobility_policy() & 0x02;
     }
 

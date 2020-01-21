@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -21,10 +21,12 @@
 
 #include "config.h"
 
+#include <atomic>
 #include <stdio.h>
 #include <time.h>
 #include <list>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <algorithm>
 #include <string>
@@ -33,22 +35,16 @@
 #include <arpa/inet.h>
 
 #include <stdexcept>
-
-#ifdef HAVE_LIBPCRE
-#include <pcre.h>
-#endif
+#include <utility>
 
 #include "globalregistry.h"
 #include "kis_mutex.h"
 #include "trackedelement.h"
 #include "entrytracker.h"
-#include "packet.h"
 #include "packetchain.h"
 #include "timetracker.h"
-#include "filtercore.h"
 #include "uuid.h"
 #include "configfile.h"
-#include "phyhandler.h"
 #include "kis_datasource.h"
 #include "packinfo_signal.h"
 #include "devicetracker_component.h"
@@ -56,408 +52,27 @@
 #include "timetracker.h"
 #include "kis_net_microhttpd.h"
 #include "structured.h"
-#include "devicetracker_httpd_pcap.h"
+#include "devicetracker_view.h"
+#include "devicetracker_workers.h"
 #include "kis_database.h"
-
-// How big the main vector of components is, if we ever get more than this
-// many tracked components we'll need to expand this but since it ties to
-// memory and track record creation it starts relatively low
-#define MAX_TRACKER_COMPONENTS	64
+#include "eventbus.h"
 
 #define KIS_PHY_ANY	-1
 #define KIS_PHY_UNKNOWN -2
 
-// fwd
-class Devicetracker;
-
-// Bitfield of basic types a device is classified as.  The device may be multiple
-// of these depending on the phy.  The UI will display them based on the type
-// in the display filter.
-//
-// Generic device.  Everything is a device.  If the phy has no
-// distinguishing factors for classifying it as anything else, this is
-// what it gets to be.
-#define KIS_DEVICE_BASICTYPE_DEVICE		0
-// Access point (in wifi terms) or otherwise central coordinating device
-// (if available in other PHYs)
-#define KIS_DEVICE_BASICTYPE_AP			1
-// Wireless client device (up to the implementor if a peer-to-peer phy
-// classifies all as clients, APs, or simply devices)
-#define KIS_DEVICE_BASICTYPE_CLIENT		2
-// Bridged/wired client, something that isn't itself homed on the wireless
-// medium
-#define KIS_DEVICE_BASICTYPE_WIRED		4
-// Adhoc/peer network
-#define KIS_DEVICE_BASICTYPE_PEER		8
-// Common mask of client types
-#define KIS_DEVICE_BASICTYPE_CLIENTMASK	6
-
-// Basic encryption types
-#define KIS_DEVICE_BASICCRYPT_NONE		0
-#define KIS_DEVICE_BASICCRYPT_ENCRYPTED	(1 << 1)
-// More detailed encryption data if available
-#define KIS_DEVICE_BASICCRYPT_L2		(1 << 2)
-#define KIS_DEVICE_BASICCRYPT_L3		(1 << 3)
-#define KIS_DEVICE_BASICCRYPT_WEAKCRYPT	(1 << 4)
-#define KIS_DEVICE_BASICCRYPT_DECRYPTED	(1 << 5)
-
-// Base of all device tracking under the new trackerentry system
-class kis_tracked_device_base : public tracker_component {
-public:
-    kis_tracked_device_base(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
-
-        register_fields();
-        reserve_fields(NULL);
-    }
-
-    kis_tracked_device_base(GlobalRegistry *in_globalreg, int in_id,
-            SharedTrackerElement e) : tracker_component(in_globalreg, in_id) {
-        
-        register_fields();
-        reserve_fields(e);
-    }
-
-    virtual ~kis_tracked_device_base() { }
-
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new kis_tracked_device_base(globalreg, get_id()));
-    }
-
-    __Proxy(key, TrackedDeviceKey, TrackedDeviceKey, TrackedDeviceKey, key);
-
-    __Proxy(macaddr, mac_addr, mac_addr, mac_addr, macaddr);
-
-    __Proxy(phyname, std::string, std::string, std::string, phyname);
-
-    __Proxy(devicename, std::string, std::string, std::string, devicename);
-    __Proxy(username, std::string, std::string, std::string, username);
-
-    __Proxy(commonname, std::string, std::string, std::string, commonname);
-
-    __Proxy(type_string, std::string, std::string, std::string, type_string);
-
-    __Proxy(basic_type_set, uint64_t, uint64_t, uint64_t, basic_type_set);
-    __ProxyBitset(basic_type_set, uint64_t, basic_type_set);
-
-    // Set the type string if any of the matching set are found
-    void set_type_string_if(std::string in_type, uint64_t if_set) {
-        if (get_basic_type_set() & if_set) 
-            set_type_string(in_type);
-    }
-
-    // Set the type string if only the matching set is found
-    void set_type_string_ifonly(std::string in_type, uint64_t if_set) {
-        if (get_basic_type_set() == if_set)
-            set_type_string(in_type);
-    }
-
-    // Set the type string if the matching set is NOT found
-    void set_type_string_ifnot(std::string in_type, uint64_t if_set) {
-        if (!(get_basic_type_set() & if_set))
-            set_type_string(in_type);
-    }
-
-
-    __Proxy(crypt_string, std::string, std::string, std::string, crypt_string);
-
-    __Proxy(basic_crypt_set, uint64_t, uint64_t, uint64_t, basic_crypt_set);
-    void add_basic_crypt(uint64_t in) { (*basic_crypt_set) |= in; }
-
-    __Proxy(first_time, uint64_t, time_t, time_t, first_time);
-    __Proxy(last_time, uint64_t, time_t, time_t, last_time);
-
-    // Simple management of last modified time
-    __Proxy(mod_time, uint64_t, time_t, time_t, mod_time);
-    void update_modtime() {
-        set_mod_time(time(0));
-    }
-
-    __Proxy(packets, uint64_t, uint64_t, uint64_t, packets);
-    __ProxyIncDec(packets, uint64_t, uint64_t, packets);
-
-    __Proxy(rx_packets, uint64_t, uint64_t, uint64_t, rx_packets);
-    __ProxyIncDec(rx_packets, uint64_t, uint64_t, rx_packets);
-
-    __Proxy(tx_packets, uint64_t, uint64_t, uint64_t, tx_packets);
-    __ProxyIncDec(tx_packets, uint64_t, uint64_t, tx_packets);
-
-    __Proxy(llc_packets, uint64_t, uint64_t, uint64_t, llc_packets);
-    __ProxyIncDec(llc_packets, uint64_t, uint64_t, llc_packets);
-
-    __Proxy(error_packets, uint64_t, uint64_t, uint64_t, error_packets);
-    __ProxyIncDec(error_packets, uint64_t, uint64_t, error_packets);
-
-    __Proxy(data_packets, uint64_t, uint64_t, uint64_t, data_packets);
-    __ProxyIncDec(data_packets, uint64_t, uint64_t, data_packets);
-
-    __Proxy(crypt_packets, uint64_t, uint64_t, uint64_t, crypt_packets);
-    __ProxyIncDec(crypt_packets, uint64_t, uint64_t, crypt_packets);
-
-    __Proxy(filter_packets, uint64_t, uint64_t, uint64_t, filter_packets);
-    __ProxyIncDec(filter_packets, uint64_t, uint64_t, filter_packets);
-
-    __Proxy(datasize, uint64_t, uint64_t, uint64_t, datasize);
-    __ProxyIncDec(datasize, uint64_t, uint64_t, datasize);
-
-    typedef kis_tracked_rrd<> rrdt;
-    __ProxyTrackable(packets_rrd, rrdt, packets_rrd);
-
-    __ProxyDynamicTrackable(location, kis_tracked_location, location, location_id);
-    __ProxyDynamicTrackable(data_rrd, rrdt, data_rrd, data_rrd_id);
-    __ProxyDynamicTrackable(location_cloud, kis_location_history, location_cloud, 
-            location_cloud_id);
-
-    typedef kis_tracked_minute_rrd<> mrrdt;
-    __ProxyDynamicTrackable(packet_rrd_bin_250, mrrdt, packet_rrd_bin_250, 
-            packet_rrd_bin_250_id);
-    __ProxyDynamicTrackable(packet_rrd_bin_500, mrrdt, packet_rrd_bin_500,
-            packet_rrd_bin_500_id);
-    __ProxyDynamicTrackable(packet_rrd_bin_1000, mrrdt, packet_rrd_bin_1000,
-            packet_rrd_bin_1000_id);
-    __ProxyDynamicTrackable(packet_rrd_bin_1500, mrrdt, packet_rrd_bin_1500,
-            packet_rrd_bin_1500_id);
-    __ProxyDynamicTrackable(packet_rrd_bin_jumbo, mrrdt, packet_rrd_bin_jumbo,
-            packet_rrd_bin_jumbo_id);
-
-    __Proxy(channel, std::string, std::string, std::string, channel);
-    __Proxy(frequency, double, double, double, frequency);
-
-    __Proxy(manuf, std::string, std::string, std::string, manuf);
-
-    __Proxy(num_alerts, uint32_t, unsigned int, unsigned int, alert);
-
-    __ProxyTrackable(signal_data, kis_tracked_signal_data, signal_data);
-
-    // Intmaps need special care by the caller
-    SharedTrackerElement get_freq_khz_map() { return freq_khz_map; }
-
-    void inc_frequency_count(double frequency);
-
-    SharedTrackerElement get_seenby_map() {
-        return seenby_map;
-    }
-
-    void inc_seenby_count(KisDatasource *source, time_t tv_sec, int frequency,
-            Packinfo_Sig_Combo *siginfo);
-
-    __ProxyTrackable(tag_map, TrackerElement, tag_map);
-
-    __Proxy(server_uuid, uuid, uuid, uuid, server_uuid);
-
-    // Non-exported internal counter used for structured sorting
-    uint64_t get_kis_internal_id() {
-        return kis_internal_id;
-    }
-
-    void set_kis_internal_id(uint64_t in_id) {
-        kis_internal_id = in_id;
-    }
-
-    // Lock our device around serialization
-    virtual void pre_serialize() {
-        local_eol_locker lock(&device_mutex);
-
-        if (get_username() != "") {
-            set_commonname(get_username());
-        } else if (get_devicename() != "") {
-            set_commonname(get_devicename());
-        } else {
-            set_commonname(get_macaddr().Mac2String());
-        }
-    }
-
-    virtual void post_serialize() {
-        local_unlocker unlock(&device_mutex);
-    }
-
-    // Protective per-device mutex, should be managed by pre/post serialization
-    // functions, and by anything modifying the device or any of the per-phy records
-    // inside it
-    kis_recursive_timed_mutex device_mutex;
-
-protected:
-    virtual void register_fields();
-    virtual void reserve_fields(SharedTrackerElement e);
-
-    // Unique, meaningless, incremental ID.  Practically, this is the order
-    // in which kismet saw devices; it has no purpose other than a sorting
-    // key which will always preserve order - time, etc, will not.  Used for breaking
-    // up long-running queries.
-    uint64_t kis_internal_id;
-
-    // Unique key
-    SharedTrackerElement key;
-
-    // Mac address (probably the key, but could be different)
-    SharedTrackerElement macaddr;
-
-    // Phy type (integer index)
-    SharedTrackerElement phyname;
-
-    // Printable name for UI summary.  For APs could be latest SSID, for BT the UAP
-    // guess, etc.
-    SharedTrackerElement devicename;
-
-    // User name for arbitrary naming
-    SharedTrackerElement username;
-
-    // Common name connected via preserialize
-    SharedTrackerElement commonname;
-
-    // Printable basic type relevant to the phy, ie "Wired", "AP", "Bluetooth", etc.
-    // This can be set per-phy and is treated as a printable interpretation.
-    // This should be empty if the phy layer is unable to add something intelligent
-    SharedTrackerElement type_string;
-
-    // Basic phy-neutral type for sorting and classification
-    SharedTrackerElement basic_type_set;
-
-    // Printable crypt string, which is set by the phy and is the best printable
-    // representation of the phy crypt options.  This should be empty if the phy
-    // layer hasn't added something intelligent.
-    SharedTrackerElement crypt_string;
-
-    // Bitset of basic phy-neutral crypt options
-    SharedTrackerElement basic_crypt_set;
-
-    // First and last seen
-    SharedTrackerElement first_time, last_time, mod_time;
-
-    // Packet counts
-    SharedTrackerElement packets, tx_packets, rx_packets,
-                   // link-level packets
-                   llc_packets,
-                   // known-bad packets
-                   error_packets,
-                   // data packets
-                   data_packets,
-                   // Encrypted data packets (double-counted with data)
-                   crypt_packets,
-                   // Excluded / filtered packets
-                   filter_packets;
-
-    // Data seen in bytes
-    SharedTrackerElement datasize;
-
-    // Packets and data RRDs
-    int packets_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<> > packets_rrd;
-
-    int data_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<> > data_rrd;
-
-    // Data bins divided by size we track, named by max size
-    int packet_rrd_bin_250_id;
-    std::shared_ptr<kis_tracked_minute_rrd<> > packet_rrd_bin_250;
-    int packet_rrd_bin_500_id;
-    std::shared_ptr<kis_tracked_minute_rrd<> > packet_rrd_bin_500;
-    int packet_rrd_bin_1000_id;
-    std::shared_ptr<kis_tracked_minute_rrd<> > packet_rrd_bin_1000;
-    int packet_rrd_bin_1500_id;
-    std::shared_ptr<kis_tracked_minute_rrd<> > packet_rrd_bin_1500;
-    int packet_rrd_bin_jumbo_id;
-    std::shared_ptr<kis_tracked_minute_rrd<> > packet_rrd_bin_jumbo;
-
-	// Channel and frequency as per PHY type
-    SharedTrackerElement channel, frequency;
-
-    // Signal data
-    std::shared_ptr<kis_tracked_signal_data> signal_data;
-    int signal_data_id;
-
-    // Global frequency distribution
-    SharedTrackerElement freq_khz_map;
-
-    // Manufacturer, if we're able to derive, either from OUI or 
-    // from other data (phy-dependent)
-    SharedTrackerElement manuf;
-
-    // Alerts triggered on this device
-    SharedTrackerElement alert;
-
-    // Stringmap of tags
-    SharedTrackerElement tag_map;
-    // Entry ID for tag map
-    int tag_entry_id;
-
-    // Location min/max/avg
-    std::shared_ptr<kis_tracked_location> location;
-    int location_id;
-
-    std::shared_ptr<kis_location_history> location_cloud;
-    int location_cloud_id;
-
-    // Seenby map (mapped by int16 device id)
-    SharedTrackerElement seenby_map;
-    int seenby_map_id;
-
-    // Server UUID which generated this device
-    SharedTrackerElement server_uuid;
-
-    // Non-exported local value for frequency count
-    int frequency_val_id;
-
-    // Non-exported local value for seenby content
-    int seenby_val_id;
-};
-
-// Packinfo references
-class kis_tracked_device_info : public packet_component {
-public:
-	kis_tracked_device_info() {
-		self_destruct = 1;
-	}
-
-    std::map<mac_addr, std::shared_ptr<kis_tracked_device_base> > devrefs;
-};
-
-// Filter-handler class.  Subclassed by a filter supplicant to be passed to the
-// device filter functions.
-class DevicetrackerFilterWorker {
-    friend class Devicetracker;
-
-public:
-    DevicetrackerFilterWorker() {
-        matched_devices.reset(new TrackerElement(TrackerVector));
-        matched_devices_vec = TrackerElementVector(matched_devices);
-    };
-    virtual ~DevicetrackerFilterWorker() { };
-
-    // Perform a match on a device
-    virtual bool MatchDevice(Devicetracker *devicetracker,
-            std::shared_ptr<kis_tracked_device_base> base) = 0;
-
-    // Finalize operations
-    virtual void Finalize(Devicetracker *devicetracker __attribute__((unused))) { }
-
-    virtual SharedTrackerElement GetMatchedDevices() {
-        return matched_devices;
-    }
-
-protected:
-    virtual void MatchedDevice(SharedTrackerElement d) {
-        local_locker lock(&worker_mutex);
-        matched_devices_vec.push_back(d);
-    }
-
-    kis_recursive_timed_mutex worker_mutex;
-
-    SharedTrackerElement matched_devices;
-    TrackerElementVector matched_devices_vec;
-};
+class kis_phy_handler;
 
 // Small database helper class for the state store; we need to be able to 
 // segregate it from the devicetracker store
-class DevicetrackerStateStore : public KisDatabase {
+class device_tracker_state_store : public kis_database {
 public:
-    DevicetrackerStateStore(GlobalRegistry *in_globalreg, Devicetracker *in_devicetracker);
-    virtual ~DevicetrackerStateStore() { }
+    device_tracker_state_store(global_registry *in_globalreg, device_tracker *in_devicetracker);
+    virtual ~device_tracker_state_store() { }
 
-    virtual int Database_UpgradeDB();
+    virtual int database_upgrade_db() override;
 
     // Store a selection of devices
-    virtual int store_devices(TrackerElementVector devices);
+    virtual int store_devices(std::shared_ptr<tracker_element_vector> devices);
 
     // Iterate over all phys and load from the database
     virtual int load_devices();
@@ -469,56 +84,86 @@ public:
     virtual int clear_all_devices();
 
     // Load a specific device
-    std::shared_ptr<kis_tracked_device_base> load_device(Kis_Phy_Handler *in_phy,
+    std::shared_ptr<kis_tracked_device_base> load_device(kis_phy_handler *in_phy,
             mac_addr in_mac);
 
 protected:
-    Devicetracker *devicetracker;
+    device_tracker *devicetracker;
 };
 
-class Devicetracker : public Kis_Net_Httpd_Chain_Stream_Handler,
-    public TimetrackerEvent, public LifetimeGlobal, public KisDatabase {
+class kis_packet;
+
+class device_tracker : public kis_net_httpd_chain_stream_handler,
+    public time_tracker_event, public lifetime_global, public kis_database {
 
 // Allow direct access for the state storing class
-friend class DevicetrackerStateStore;
+friend class device_tracker_state_store;
 
 public:
-    static std::shared_ptr<Devicetracker> create_devicetracker(GlobalRegistry *in_globalreg) {
-        std::shared_ptr<Devicetracker> mon(new Devicetracker(in_globalreg));
+    static std::string global_name() { return "DEVICETRACKER"; }
+
+    static std::shared_ptr<device_tracker> create_device_tracker(global_registry *in_globalreg) {
+        std::shared_ptr<device_tracker> mon(new device_tracker(in_globalreg));
         in_globalreg->devicetracker = mon.get();
-        in_globalreg->RegisterLifetimeGlobal(mon);
-        in_globalreg->InsertGlobal("DEVICE_TRACKER", mon);
+        in_globalreg->register_lifetime_global(mon);
+        in_globalreg->insert_global(global_name(), mon);
         return mon;
     }
 
 private:
-	Devicetracker(GlobalRegistry *in_globalreg);
+	device_tracker(global_registry *in_globalreg);
 
 public:
-	virtual ~Devicetracker();
+	virtual ~device_tracker();
 
 	// Register a phy handler weak class, used to instantiate the strong class
 	// inside devtracker
-	int RegisterPhyHandler(Kis_Phy_Handler *in_weak_handler);
+	int register_phy_handler(kis_phy_handler *in_weak_handler);
 
-	Kis_Phy_Handler *FetchPhyHandler(int in_phy);
-    Kis_Phy_Handler *FetchPhyHandlerByName(std::string in_name);
+	kis_phy_handler *fetch_phy_handler(int in_phy);
+    kis_phy_handler *fetch_phy_handler_by_name(std::string in_name);
 
-    std::string FetchPhyName(int in_phy);
+    // event_bus event we inject when a new phy is added
+    class event_new_phy : public eventbus_event {
+    public:
+        static std::string event() { return "NEW_PHY"; }
 
-	int FetchNumDevices();
-	int FetchNumPackets();
+        event_new_phy(kis_phy_handler *handler) :
+            eventbus_event(event()),
+            phy{handler} { }
+        virtual ~event_new_phy() {}
 
-	int AddFilter(std::string in_filter);
-	int AddNetCliFilter(std::string in_filter);
+        kis_phy_handler *phy;
+    };
+
+    // Eventbus event for a device *once it is completely added*.
+    class event_new_device : public eventbus_event {
+    public:
+        static std::string event() { return "NEW_DEVICE"; }
+
+        event_new_device(std::shared_ptr<kis_tracked_device_base> device) :
+            eventbus_event(event()),
+            device{device} { }
+        virtual ~event_new_device() {}
+
+        std::shared_ptr<kis_tracked_device_base> device;
+    };
+
+    std::string fetch_phy_name(int in_phy);
+
+	int fetch_num_devices();
+	int fetch_num_packets();
+
+	int add_filter(std::string in_filter);
+	int add_net_cli_filter(std::string in_filter);
 
     // Flag that we've altered the device structure in a way that a client should
     // perform a full pull.  For instance, removing devices or device record
     // components due to timeouts / max device cleanup
-    void UpdateFullRefresh();
+    void update_full_refresh();
 
 	// Look for an existing device record
-    std::shared_ptr<kis_tracked_device_base> FetchDevice(TrackedDeviceKey in_key);
+    std::shared_ptr<kis_tracked_device_base> fetch_device(device_key in_key);
 
     // Perform a device filter.  Pass a subclassed filter instance.
     //
@@ -527,20 +172,56 @@ public:
     // to operate.
     //
     // Typically used to build a subset of devices for serialization
-    void MatchOnDevices(DevicetrackerFilterWorker *worker, bool batch = true);
+    void do_device_work(std::shared_ptr<device_tracker_filter_worker> worker, bool batch = true);
+    // Perform a read-only match; MAY NOT edit devices in the worker!
+    void do_readonly_device_work(std::shared_ptr<device_tracker_filter_worker> worker, bool batch = true);
 
     // Perform a device filter as above, but provide a source vec rather than the
-    // list of ALL devices
-    void MatchOnDevices(DevicetrackerFilterWorker *worker, 
-            TrackerElementVector source_vec, bool batch = true);
+    // list of ALL devices.  The source vector is duplicated under mutex and then processed.
+    void do_device_work(std::shared_ptr<device_tracker_filter_worker> worker, 
+            std::shared_ptr<tracker_element_vector> source_vec, bool batch = true);
+    // Perform a readonly filter, MUST NOT modify devices
+    void do_readonly_device_work(std::shared_ptr<device_tracker_filter_worker> worker, 
+            std::shared_ptr<tracker_element_vector> source_vec, bool batch = true);
 
-	typedef std::map<TrackedDeviceKey, std::shared_ptr<kis_tracked_device_base> >::iterator device_itr;
-	typedef std::map<TrackedDeviceKey, std::shared_ptr<kis_tracked_device_base> >::const_iterator const_device_itr;
+    // Perform a device filter as above, but provide a source vec rather than the
+    // list of ALL devices.  The source vector is NOT duplicated, caller must ensure this is
+    // a safe operation (the vector must not be modified during execution of the worker)
+    void do_device_work_raw(std::shared_ptr<device_tracker_filter_worker> worker, 
+            std::shared_ptr<tracker_element_vector> source_vec, bool batch = true);
+    // Perform a readonly match
+    void do_readonly_device_work_raw(std::shared_ptr<device_tracker_filter_worker> worker, 
+            std::shared_ptr<tracker_element_vector> source_vec, bool batch = true);
 
-	static void Usage(char *argv);
+    // Perform a device filter as above, but provide a stl vector instead of the list of
+    // ALL devices in the system; the source vector is duplicated under mutex and then processed.
+    void do_device_work(std::shared_ptr<device_tracker_filter_worker> worker,
+            const std::vector<std::shared_ptr<kis_tracked_device_base>>& source_vec,
+            bool batch = true);
+    // RO only
+    void do_readonly_device_work(std::shared_ptr<device_tracker_filter_worker> worker,
+            const std::vector<std::shared_ptr<kis_tracked_device_base>>& source_vec,
+            bool batch = true);
+
+    // Perform a device filter as above, but provide a stl vector instead of the list of
+    // ALL devices in the system; the source vector is not duplicated, the caller must ensure
+    // this is a safe operation (the vector must not be modified during execution of the worker)
+    void do_device_work_raw(std::shared_ptr<device_tracker_filter_worker> worker,
+            const std::vector<std::shared_ptr<kis_tracked_device_base>>& source_vec,
+            bool batch = true);
+    // RO only
+    void do_readonly_device_work_raw(std::shared_ptr<device_tracker_filter_worker> worker,
+            const std::vector<std::shared_ptr<kis_tracked_device_base>>& source_vec,
+            bool batch = true);
+
+    using device_map_t = std::unordered_map<device_key, std::shared_ptr<kis_tracked_device_base>>;
+    using device_itr = device_map_t::iterator;
+    using const_device_itr = device_map_t::const_iterator;
+
+	static void usage(char *argv);
 
 	// Common classifier for keeping phy counts
-	int CommonTracker(kis_packet *in_packet);
+	int common_tracker(kis_packet *in_packet);
 
     // Add common into to a device.  If necessary, create the new device.
     //
@@ -555,7 +236,7 @@ public:
     // Phy handlers should call this to populate associated devices when a phy
     // packet is encountered.
     //
-    // It is recommended that plugin developers look at the UpdateCommonDevice
+    // It is recommended that plugin developers look at the update_common_device
     // implementation in devicetracker.cc as well as the reference implementations
     // in phy80211 and other native code, as this is one of the most complex
     // functions a phy handler will interact with when building trackable devices.
@@ -583,34 +264,29 @@ public:
 // Only update location if we have no existing location
 #define UCD_UPDATE_EMPTY_LOCATION   (1 << 8)
 
-    std::shared_ptr<kis_tracked_device_base> UpdateCommonDevice(kis_common_info *pack_common,
-            mac_addr in_mac, Kis_Phy_Handler *phy, kis_packet *in_pack, unsigned int in_flags);
+    std::shared_ptr<kis_tracked_device_base> update_common_device(kis_common_info *pack_common,
+            mac_addr in_mac, kis_phy_handler *phy, kis_packet *in_pack, unsigned int in_flags,
+            std::string in_basic_type);
 
     // Set the common name of a device (and log it in the database for future runs)
-    void SetDeviceUserName(std::shared_ptr<kis_tracked_device_base> in_dev,
+    void set_device_user_name(std::shared_ptr<kis_tracked_device_base> in_dev,
             std::string in_username);
 
     // Set an arbitrary tag (and log it in the database for future runs)
-    void SetDeviceTag(std::shared_ptr<kis_tracked_device_base> in_dev,
+    void set_device_tag(std::shared_ptr<kis_tracked_device_base> in_dev,
             std::string in_tag, std::string in_content);
 
     // HTTP handlers
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
+    virtual bool httpd_verify_path(const char *path, const char *method);
 
-    virtual int Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+    virtual int httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
             size_t *upload_data_size);
 
-    virtual int Httpd_PostComplete(Kis_Net_Httpd_Connection *concls);
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls);
     
-    // Generate a list of all phys, serialized appropriately.  If specified,
-    // wrap it in a dictionary and name it with the key in in_wrapper, which
-    // is required for some js libs like datatables.
-    void httpd_all_phys(std::string url, std::ostream &stream, 
-            std::string in_wrapper_key = "");
-
-    // Timetracker event handler
+    // time_tracker event handler
     virtual int timetracker_event(int eventid);
 
     // CLI extension
@@ -624,38 +300,63 @@ public:
     }
 
     // Database API
-    virtual int Database_UpgradeDB();
+    virtual int database_upgrade_db();
 
-    // Store all devices to the database
+#if 0
+    // Store all devices to the state database
     virtual int store_devices();
     virtual int store_all_devices();
-    virtual int store_devices(TrackerElementVector devices);
+    virtual int store_devices(std::shared_ptr<tracker_element_vector> devices);
+#endif
 
     // Store all devices to the database
     virtual void databaselog_write_devices();
-    virtual void databaselog_write_all_devices();
-    virtual void databaselog_write_devices(TrackerElementVector devices);
 
     // Iterate over all phys and load from the database
     virtual int load_devices();
 
+    // View API
+    virtual bool add_view(std::shared_ptr<device_tracker_view> in_view);
+    virtual void remove_view(const std::string& in_view_id);
+
+    virtual void new_view_device(std::shared_ptr<kis_tracked_device_base> in_device);
+    virtual void update_view_device(std::shared_ptr<kis_tracked_device_base> in_device);
+    virtual void remove_view_device(std::shared_ptr<kis_tracked_device_base> in_device);
+
+    // Get phy views
+    std::shared_ptr<device_tracker_view> get_phy_view(int in_phy);
+
 protected:
-	GlobalRegistry *globalreg;
-    std::shared_ptr<EntryTracker> entrytracker;
-    std::shared_ptr<Packetchain> packetchain;
+	global_registry *globalreg;
+    std::shared_ptr<entry_tracker> entrytracker;
+    std::shared_ptr<packet_chain> packetchain;
+    std::shared_ptr<event_bus> eventbus;
+    std::shared_ptr<alert_tracker> alertracker;
+
+    unsigned long new_datasource_evt_id, new_device_evt_id;
+
+    int packetchain_tracking_done_id;
+
+    // Map of seen-by views
+    bool map_seenby_views;
+    std::unordered_map<uuid, std::shared_ptr<device_tracker_view>> seenby_view_map;
+
+    // Map of phy views
+    bool map_phy_views;
+    std::unordered_map<int, std::shared_ptr<device_tracker_view>> phy_view_map;
 
     // Base IDs for tracker components
-    int device_list_base_id, device_base_id, phy_base_id, phy_entry_id;
+    int device_list_base_id, device_base_id;
     int device_summary_base_id;
     int device_update_required_id, device_update_timestamp_id;
 
     int dt_length_id, dt_filter_id, dt_draw_id;
 
 	// Total # of packets
-	int num_packets;
-	int num_datapackets;
-	int num_errorpackets;
-	int num_filterpackets;
+    std::atomic<int> num_packets;
+	std::atomic<int> num_datapackets;
+	std::atomic<int> num_errorpackets;
+	std::atomic<int> num_filterpackets;
 
 	// Per-phy #s of packets
     std::map<int, int> phy_packets;
@@ -664,7 +365,6 @@ protected:
 	std::map<int, int> phy_filterpackets;
 
     // Total packet history
-    int packets_rrd_id;
     std::shared_ptr<kis_tracked_rrd<> > packets_rrd;
 
     // Timeout of idle devices
@@ -683,7 +383,7 @@ protected:
     int device_storage_timer;
 
     // Timestamp for the last time we removed a device
-    time_t full_refresh_time;
+    std::atomic<time_t> full_refresh_time;
 
     // Do we track history clouds?
     bool track_history_cloud;
@@ -693,11 +393,31 @@ protected:
 	int devcomp_ref_common;
 
     // Packet components we add or interact with
-	int pack_comp_device, pack_comp_common, pack_comp_basicdata,
-		pack_comp_radiodata, pack_comp_gps, pack_comp_datasrc;
+    int pack_comp_device, pack_comp_common, pack_comp_basicdata,
+        pack_comp_radiodata, pack_comp_gps, pack_comp_datasrc,
+        pack_comp_mangleframe;
+
+
+    // Generic device alert based on flagged MACs
+    int alert_macdevice_found_ref, alert_macdevice_lost_ref;
+    // Timeouts
+    int devicefound_timeout;
+    int devicelost_timeout;
+    // Configuration map for devices we look for
+    // 1 = seen only
+    // 2 = lost only
+    // 3 = seen and lost
+    std::map<mac_addr, unsigned int> macdevice_alert_conf_map;
+    // Timeout event
+    int macdevice_alert_timeout_timer;
+    // Trigger event called to see if we need to alert devices have
+    // stopped transmitting
+    void macdevice_timer_event();
+    // Devices we've flagged for timeout alerts
+    std::vector<std::shared_ptr<kis_tracked_device_base>> macdevice_flagged_vec;
 
 	// Tracked devices
-    std::map<TrackedDeviceKey, std::shared_ptr<kis_tracked_device_base> > tracked_map;
+    device_map_t tracked_map;
 	// Vector of tracked devices so we can iterate them quickly
     std::vector<std::shared_ptr<kis_tracked_device_base> > tracked_vec;
     // MAC address lookups are incredibly expensive from the webui if we don't
@@ -708,36 +428,37 @@ protected:
     // Immutable vector, one entry per device; may never be sorted.  Devices
     // which are removed are set to 'null'.  Each position corresponds to the
     // device ID.
-    TrackerElementVector immutable_tracked_vec;
+    std::shared_ptr<tracker_element_vector> immutable_tracked_vec;
 
-	// Filtering
-	FilterCore *track_filter;
+    // List of views using new API as we transition the rest to the new API
+    kis_recursive_timed_mutex view_mutex;
+    std::shared_ptr<tracker_element_vector> view_vec;
+    std::shared_ptr<kis_net_httpd_simple_tracked_endpoint> view_endp;
+
+    // Multimac endpoint using new http API
+    std::shared_ptr<kis_net_httpd_simple_post_endpoint> multimac_endp;
+    unsigned int multimac_endp_handler(std::ostream& stream, const std::string& uri,
+            shared_structured structured, kis_net_httpd_connection::variable_cache_map& variable_cache);
+
+    // /phys/all_phys.json endpoint using new simple endpoint API
+    std::shared_ptr<kis_net_httpd_simple_tracked_endpoint> all_phys_endp;
+    std::shared_ptr<tracker_element> all_phys_endp_handler();
+    int phy_phyentry_id, phy_phyname_id, phy_devices_count_id, 
+        phy_packets_count_id, phy_phyid_id;
 
 	// Registered PHY types
 	int next_phy_id;
-    std::map<int, Kis_Phy_Handler *> phy_handler_map;
-
-    // Insert a device directly into the records
-    void AddDevice(std::shared_ptr<kis_tracked_device_base> device);
+    std::map<int, kis_phy_handler *> phy_handler_map;
 
     kis_recursive_timed_mutex devicelist_mutex;
 
-    std::shared_ptr<Devicetracker_Httpd_Pcap> httpd_pcap;
-
-    // Load a specific device
-    virtual std::shared_ptr<kis_tracked_device_base> load_device(Kis_Phy_Handler *phy, 
-            mac_addr mac);
-
-    // Common device interpretation layer
-    virtual std::shared_ptr<kis_tracked_device_base> 
-        convert_stored_device(mac_addr macaddr, 
-                const unsigned char *raw_stored_data, unsigned long stored_len);
-
+#if 0
     // Timestamp of the last time we wrote the device list, if we're storing state
-    time_t last_devicelist_saved;
+    std::atomic<time_t> last_devicelist_saved;
+#endif
 
     kis_recursive_timed_mutex storing_mutex;
-    bool devices_storing;
+    std::atomic<bool> devices_storing;
 
     // Do we store devices?
     bool persistent_storage;
@@ -745,7 +466,7 @@ protected:
     unsigned long persistent_storage_timeout;
 
     // Persistent database (independent of our tags, etc db)
-    DevicetrackerStateStore *statestore;
+    device_tracker_state_store *statestore;
 
     // Loading mode
     enum persistent_mode_e {
@@ -756,69 +477,49 @@ protected:
     // Do we use persistent compression when storing
     bool persistent_compression;
 
-    // Load stored username
-    void load_stored_username(std::shared_ptr<kis_tracked_device_base> in_dev);
-
-    // Load stored tags
-    void load_stored_tags(std::shared_ptr<kis_tracked_device_base> in_dev);
-
     // If we log devices to the kismet database...
     int databaselog_timer;
     time_t last_database_logged;
     kis_recursive_timed_mutex databaselog_mutex;
     bool databaselog_logging;
-};
 
-class kis_tracked_phy : public tracker_component {
-public:
-    kis_tracked_phy(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
-        register_fields();
-        reserve_fields(NULL);
-    }
-
-    kis_tracked_phy(GlobalRegistry *in_globalreg, int in_id,
-            SharedTrackerElement e) :
-        tracker_component(in_globalreg, in_id) {
-
-        register_fields();
-        reserve_fields(e);
-    }
-
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new kis_tracked_phy(globalreg, get_id()));
-    }
-
-    __Proxy(phy_id, int32_t, int32_t, int32_t, phy_id);
-    __Proxy(phy_name, std::string, std::string, std::string, phy_name);
-
-    void set_from_phy(Devicetracker *devicetracker, int phy) {
-        set_phy_id(phy);
-        set_phy_name(devicetracker->FetchPhyName(phy));
-    }
+    // Do we constrain memory by not tracking RRD data?
+    bool ram_no_rrd;
 
 protected:
-    virtual void register_fields() {
-        tracker_component::register_fields();
+    // Handle new datasources and create endpoints for them
+    void handle_new_datasource_event(std::shared_ptr<eventbus_event> evt);
 
-        RegisterField("kismet.phy.id", TrackerInt32,
-                "phy id", &phy_id);
-        RegisterField("kismet.phy.name", TrackerString,
-                "phy name", &phy_name);
-    }
+    // Handle a new device & add it to views, trigger alerts, etc
+    void handle_new_device_event(std::shared_ptr<eventbus_event> evt);
 
-    SharedTrackerElement phy_id;
-    SharedTrackerElement phy_name;
+    // Insert a device directly into the records
+    void add_device(std::shared_ptr<kis_tracked_device_base> device);
+
+    // Load a specific device
+    virtual std::shared_ptr<kis_tracked_device_base> load_device(kis_phy_handler *phy, 
+            mac_addr mac);
+
+    // Common device interpretation layer
+    virtual std::shared_ptr<kis_tracked_device_base> 
+        convert_stored_device(mac_addr macaddr, 
+                const unsigned char *raw_stored_data, unsigned long stored_len);
+
+    // Load stored username
+    void load_stored_username(std::shared_ptr<kis_tracked_device_base> in_dev);
+
+    // Load stored tags
+    void load_stored_tags(std::shared_ptr<kis_tracked_device_base> in_dev);
 };
 
 class devicelist_scope_locker {
 public:
-    devicelist_scope_locker(Devicetracker *in_tracker) {
+    devicelist_scope_locker(device_tracker *in_tracker) {
         in_tracker->lock_devicelist();
         tracker = in_tracker;
     }
 
-    devicelist_scope_locker(std::shared_ptr<Devicetracker> in_tracker) {
+    devicelist_scope_locker(std::shared_ptr<device_tracker> in_tracker) {
         in_tracker->lock_devicelist();
         sharedtracker = in_tracker;
         tracker = NULL;
@@ -832,170 +533,9 @@ public:
     }
 
 private:
-    Devicetracker *tracker;
-    std::shared_ptr<Devicetracker> sharedtracker;
+    device_tracker *tracker;
+    std::shared_ptr<device_tracker> sharedtracker;
 };
-
-// C++ lambda matcher
-class devicetracker_function_worker : public DevicetrackerFilterWorker {
-public:
-    devicetracker_function_worker(GlobalRegistry *in_globalreg,
-            std::function<bool (Devicetracker *, 
-                std::shared_ptr<kis_tracked_device_base>)> in_mcb,
-            std::function<void (Devicetracker *)> in_fcb);
-    virtual ~devicetracker_function_worker();
-
-    virtual bool MatchDevice(Devicetracker *devicetracker,
-            std::shared_ptr<kis_tracked_device_base> device);
-
-    virtual void Finalize(Devicetracker *devicetracker);
-
-protected:
-    GlobalRegistry *globalreg;
-
-    std::function<bool (Devicetracker *, 
-            std::shared_ptr<kis_tracked_device_base>)> mcb;
-    std::function<void (Devicetracker *)> fcb;
-};
-
-// Matching worker to match fields against a string search term
-
-class devicetracker_stringmatch_worker : public DevicetrackerFilterWorker {
-public:
-    // Prepare the worker with the query and the vector of paths we
-    // query against.  The vector of paths is equivalent to a field
-    // summary/request field path, and can be extracted directly from 
-    // that object.
-    // in_devvec_object is the object the responses are placed into.
-    // in_devvec_object must be a vector object.
-    devicetracker_stringmatch_worker(GlobalRegistry *in_globalreg,
-            std::string in_query,
-            std::vector<std::vector<int> > in_paths);
-
-    virtual ~devicetracker_stringmatch_worker();
-
-    virtual bool MatchDevice(Devicetracker *devicetracker,
-            std::shared_ptr<kis_tracked_device_base> device);
-
-    virtual void Finalize(Devicetracker *devicetracker);
-
-protected:
-    GlobalRegistry *globalreg;
-    std::shared_ptr<EntryTracker> entrytracker;
-
-    std::string query;
-    std::vector<std::vector<int> > fieldpaths;
-
-    // Make a macaddr query out of it, too
-    uint64_t mac_query_term;
-    unsigned int mac_query_term_len;
-};
-
-#ifdef HAVE_LIBPCRE
-// Retrieve a list of devices based on complex field paths and
-// return them in a vector sharedtrackerelement
-class devicetracker_pcre_worker : public DevicetrackerFilterWorker {
-public:
-    class pcre_filter {
-    public:
-        pcre_filter() {
-            re = NULL;
-            study = NULL;
-        }
-
-        ~pcre_filter() {
-            if (re != NULL)
-                pcre_free(re);
-            if (study != NULL)
-                pcre_free(study);
-        }
-
-        std::string target;
-        pcre *re;
-        pcre_extra *study;
-    };
-
-    // Prepare the worker with a set of filters and the object we fill our
-    // results into.  in_devvec_object must be a vector object.
-    devicetracker_pcre_worker(GlobalRegistry *in_globalreg,
-            std::vector<std::shared_ptr<devicetracker_pcre_worker::pcre_filter> > in_filter_vec);
-
-    // Shortcut function for building a PCRE from an incoming standard filter
-    // description on a POST event:
-    // Prepare the worker with a set of filters contained in a raw Structured 
-    // object, which is expected to be a vector of [field, regex] pairs.
-    // Results are filled into in_devvec_object which is expected to be a vector object
-    // This MAY THROW EXCEPTIONS from structured parsing or the PCRE parsing!
-    devicetracker_pcre_worker(GlobalRegistry *in_globalreg,
-            SharedStructured raw_pcre_vec);
-
-    // Shortcut function for building a PCRE worker from an incoming list of
-    // filters, targeting a single field (such as a SSID match):
-    // Prepare the worker with a set of filters referencing a single field
-    // target.  The filters should be contained in a raw Structured object, which
-    // is expected to be a vector of filter strings.  Results are filled into
-    // in_devvec_object which is expected to be a vector object.
-    // This MAY THROW EXCEPTIONS from structured parsing or the PCRE parsing!
-    devicetracker_pcre_worker(GlobalRegistry *in_globalreg,
-            std::string in_target,
-            SharedStructured raw_pcre_vec);
-
-    virtual ~devicetracker_pcre_worker();
-
-    bool get_error() { return error; }
-
-    virtual bool MatchDevice(Devicetracker *devicetracker,
-            std::shared_ptr<kis_tracked_device_base> device);
-
-    virtual void Finalize(Devicetracker *devicetracker);
-
-protected:
-    GlobalRegistry *globalreg;
-    std::shared_ptr<EntryTracker> entrytracker;
-
-    int pcre_match_id;
-
-    std::vector<std::shared_ptr<devicetracker_pcre_worker::pcre_filter> > filter_vec;
-    bool error;
-};
-#else
-class devicetracker_pcre_worker : public DevicetrackerFilterWorker {
-public:
-    class pcre_filter {
-    public:
-        pcre_filter() { }
-    };
-
-    // Prepare the worker with a set of filters and the object we fill our
-    // results into.  in_devvec_object must be a vector object.
-    devicetracker_pcre_worker(GlobalRegistry *in_globalreg,
-            std::vector<std::shared_ptr<devicetracker_pcre_worker::pcre_filter> > in_filter_vec) {
-        throw(std::runtime_error("Kismet not compiled with PCRE support"));
-    }
-
-    devicetracker_pcre_worker(GlobalRegistry *in_globalreg,
-            SharedStructured raw_pcre_vec) {
-        throw(std::runtime_error("Kismet not compiled with PCRE support"));
-    }
-
-    devicetracker_pcre_worker(GlobalRegistry *in_globalreg,
-            std::string in_target,
-            SharedStructured raw_pcre_vec) {
-        throw(std::runtime_error("Kismet not compiled with PCRE support"));
-    }
-
-    virtual ~devicetracker_pcre_worker() { };
-
-    bool get_error() { return true; }
-
-    virtual bool MatchDevice(Devicetracker *devicetracker,
-            std::shared_ptr<kis_tracked_device_base> device) { return false; };
-
-    virtual void Finalize(Devicetracker *devicetracker) { };
-};
-
-
-#endif
 
 #endif
 

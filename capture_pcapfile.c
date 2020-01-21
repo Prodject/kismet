@@ -66,7 +66,6 @@
 #include <arpa/inet.h>
 
 #include "config.h"
-#include "simple_datasource_proto.h"
 #include "capture_framework.h"
 
 typedef struct {
@@ -74,12 +73,15 @@ typedef struct {
     char *pcapfname;
     int datalink_type;
     int override_dlt;
+
     int realtime;
     struct timeval last_ts;
+
+    unsigned int pps_throttle;
 } local_pcap_t;
 
 int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
-        char *msg, char **uuid, simple_cap_proto_frame_t *frame,
+        char *msg, char **uuid, KismetExternal__Command *frame,
         cf_params_interface_t **ret_interface, 
         cf_params_spectrum_t **ret_spectrum) {
     char *placeholder = NULL;
@@ -129,20 +131,23 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     pcap_close(pd);
 
-    /* Kluge a UUID out of the name */
-    snprintf(errstr, PCAP_ERRBUF_SIZE, "%08X-0000-0000-0000-0000%08X",
-            adler32_csum((unsigned char *) "kismet_cap_pcapfile", 
-                strlen("kismet_cap_pcapfile")) & 0xFFFFFFFF,
-            adler32_csum((unsigned char *) pcapfname, 
-                strlen(pcapfname)) & 0xFFFFFFFF);
-    *uuid = strdup(errstr);
-
+    if ((placeholder_len = cf_find_flag(&placeholder, "uuid", definition)) > 0) {
+        *uuid = strdup(placeholder);
+    } else {
+        /* Kluge a UUID out of the name */
+        snprintf(errstr, PCAP_ERRBUF_SIZE, "%08X-0000-0000-0000-0000%08X",
+                adler32_csum((unsigned char *) "kismet_cap_pcapfile", 
+                    strlen("kismet_cap_pcapfile")) & 0xFFFFFFFF,
+                adler32_csum((unsigned char *) pcapfname, 
+                    strlen(pcapfname)) & 0xFFFFFFFF);
+        *uuid = strdup(errstr);
+    }
 
     return 1;
 }
 
 int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
-        char *msg, uint32_t *dlt, char **uuid, simple_cap_proto_frame_t *frame,
+        char *msg, uint32_t *dlt, char **uuid, KismetExternal__Command *frame,
         cf_params_interface_t **ret_interface, 
         cf_params_spectrum_t **ret_spectrum) {
     char *placeholder = NULL;
@@ -210,7 +215,7 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
                 strlen(pcapfname)) & 0xFFFFFFFF);
     *uuid = strdup(errstr);
 
-    /* Succesful open with no channel, hop, or chanset data */
+    /* Successful open with no channel, hop, or chanset data */
     snprintf(msg, STATUS_MAX, "Opened pcapfile '%s' for playback", pcapfname);
 
     if ((placeholder_len = cf_find_flag(&placeholder, "realtime", definition)) > 0) {
@@ -219,6 +224,14 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
                     "Pcapfile '%s' will replay in realtime", pcapfname);
             cf_send_message(caph, errstr, MSGFLAG_INFO);
             local_pcap->realtime = 1;
+        }
+    } else if ((placeholder_len = cf_find_flag(&placeholder, "pps", definition)) > 0) {
+        unsigned int pps;
+        if (sscanf(placeholder, "%u", &pps) == 1) {
+            snprintf(errstr, PCAP_ERRBUF_SIZE,
+                    "Pcapfile '%s' will throttle to %u packets per second", pcapfname, pps);
+            cf_send_message(caph, errstr,MSGFLAG_INFO);
+            local_pcap->pps_throttle = pps;
         }
     }
 
@@ -266,6 +279,14 @@ void pcap_dispatch_cb(u_char *user, const struct pcap_pkthdr *header,
         }
     }
 
+    /* If we're doing 'packet per second' throttling, delay accordingly */
+    if (local_pcap->pps_throttle > 0) {
+        delay_usec = 1000000L / local_pcap->pps_throttle;
+
+        if (delay_usec != 0)
+            usleep(delay_usec);
+    }
+
     /* Try repeatedly to send the packet; go into a thread wait state if
      * the write buffer is full & we'll be woken up as soon as it flushes
      * data out in the main select() loop */
@@ -273,9 +294,10 @@ void pcap_dispatch_cb(u_char *user, const struct pcap_pkthdr *header,
         if ((ret = cf_send_data(caph, 
                         NULL, NULL, NULL,
                         header->ts, 
+                        local_pcap->datalink_type,
                         header->caplen, (uint8_t *) data)) < 0) {
             pcap_breakloop(local_pcap->pd);
-            cf_send_error(caph, "unable to send DATA frame");
+            cf_send_error(caph, 0, "unable to send DATA frame");
             cf_handler_spindown(caph);
         } else if (ret == 0) {
             /* Go into a wait for the write buffer to get flushed */
@@ -319,7 +341,8 @@ int main(int argc, char *argv[]) {
         .override_dlt = -1,
         .realtime = 0,
         .last_ts.tv_sec = 0,
-        .last_ts.tv_usec = 0
+        .last_ts.tv_usec = 0,
+        .pps_throttle = 0,
     };
 
 #if 0
@@ -355,6 +378,9 @@ int main(int argc, char *argv[]) {
         cf_print_help(caph, argv[0]);
         return -1;
     }
+
+    /* Support remote capture by launching the remote loop */
+    cf_handler_remote_capture(caph);
 
     cf_handler_loop(caph);
 

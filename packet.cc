@@ -26,19 +26,22 @@
 #endif
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
 
 #include "globalregistry.h"
-#include "packetchain.h"
 #include "macaddr.h"
+#include "packet.h"
+#include "packetchain.h"
 #include "packet_ieee80211.h"
 
-kis_packet::kis_packet(GlobalRegistry *in_globalreg) {
+
+kis_packet::kis_packet(global_registry *in_globalreg) {
 	globalreg = in_globalreg;
 
 	error = 0;
+    crc_ok = 0;
 	filtered = 0;
     duplicate = 0;
 
@@ -51,30 +54,25 @@ kis_packet::kis_packet(GlobalRegistry *in_globalreg) {
 }
 
 kis_packet::~kis_packet() {
-	// Delete everything we contain when we die.  I hope whomever put
-	// it there expected this.
-	for (unsigned int y = 0; y < MAX_PACKET_COMPONENTS; y++) {
-		packet_component *pcm = content_vec[y];
+    for (auto pcm : content_vec) {
+        if (pcm == nullptr)
+            continue;
 
-		if (pcm == NULL)
-			continue;
-
-		// If it's marked for self-destruction, delete it.  Otherwise, 
-		// someone else is responsible for removing it.
-		if (pcm->self_destruct)
-			delete pcm;
-
-		content_vec[y] = NULL;
-	}
+        if (pcm->self_destruct)
+            delete pcm;
+    }
 }
    
 void kis_packet::insert(const unsigned int index, packet_component *data) {
-	if (index >= MAX_PACKET_COMPONENTS)
-		return;
+	if (index >= MAX_PACKET_COMPONENTS) 
+        throw std::runtime_error(fmt::format("Attempted to reference packet component index {} "
+                    "outside of the maximum bounds {}; this implies the pack_comp_x or _PCM "
+                    "index is corrupt.", index, MAX_PACKET_COMPONENTS));
+
 	if (content_vec[index] != NULL)
 		fprintf(stderr, "DEBUG/WARNING: Leaking packet component %u/%s, inserting "
 				"on top of existing\n", index,
-				globalreg->packetchain->FetchPacketComponentName(index).c_str());
+				globalreg->packetchain->fetch_packet_component_name(index).c_str());
 	content_vec[index] = data;
 }
 

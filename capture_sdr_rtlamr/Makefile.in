@@ -1,0 +1,20 @@
+include ../Makefile.inc
+
+MONITOR_BIN = kismet_cap_sdr_rtlamr
+
+all: 
+	( cd KismetCaptureRtlamr/kismetexternal; \
+	  $(PROTOCBIN) -I ../../../protobuf_definitions --python_out=. ../../../protobuf_definitions/*.proto; \
+	  sed -i -E 's/^import kismet_/from . import kismet_/' *_pb2.py ; \
+	)
+	$(PYTHON) ./setup.py bdist
+
+install:
+	$(PYTHON) ./setup.py install
+
+protobuf:
+	$(PROTOCBIN) -I ../protobuf_definitions --python_out=./KismetCaptureRtlamr ../protobuf_definitions/*.proto
+
+clean:
+	@-$(PYTHON) ./setup.py clean
+

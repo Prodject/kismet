@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -33,13 +33,10 @@
 
 // Raw NMEA over TCP, as served from many phone apps
 
-class GPSTCP : public GPSNMEA {
+class kis_gps_tcp : public kis_gps_nmea {
 public:
-    GPSTCP(GlobalRegistry *in_globalreg, SharedGpsBuilder in_builder);
-    virtual ~GPSTCP();
-
-    // BufferInterface API - buffer available implemented in gpsnmea
-    virtual void BufferError(std::string error);
+    kis_gps_tcp(shared_gps_builder in_builder);
+    virtual ~kis_gps_tcp();
 
     virtual bool open_gps(std::string in_opts);
 
@@ -50,9 +47,10 @@ public:
 protected:
     time_t error_reconnect_timer;
 
-    std::shared_ptr<PollableTracker> pollabletracker;
-   
-    std::shared_ptr<TcpClientV2> tcpclient;
+    std::shared_ptr<pollable_tracker> pollabletracker;
+    std::shared_ptr<tcp_client_v2> tcpclient;
+
+    virtual void buffer_error(std::string error);
 
     std::string host;
     unsigned int port;
@@ -70,14 +68,14 @@ protected:
     static int time_event_reconnect(TIMEEVENT_PARMS);
 };
 
-class GPSTCPBuilder : public KisGpsBuilder {
+class gps_tcp_builder : public kis_gps_builder {
 public:
-    GPSTCPBuilder(GlobalRegistry *in_globalreg) : 
-        KisGpsBuilder(in_globalreg, 0) { 
+    gps_tcp_builder() : 
+        kis_gps_builder() { 
         initialize();
     }
 
-    virtual void initialize() {
+    virtual void initialize() override {
         set_int_gps_class("tcp");
         set_int_gps_class_description("Raw NMEA over TCP (typically from a smartphone app)");
         set_int_gps_priority(-1000);
@@ -85,8 +83,8 @@ public:
         set_int_singleton(false);
     }
 
-    virtual SharedGps build_gps(SharedGpsBuilder in_builder) {
-        return SharedGps(new GPSTCP(globalreg, in_builder));
+    virtual shared_gps build_gps(shared_gps_builder in_builder) override {
+        return shared_gps(new kis_gps_tcp(in_builder));
     }
 };
 

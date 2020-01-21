@@ -29,6 +29,7 @@
 #include <memory>
 #include <vector>
 #include <kaitai/kaitaistream.h>
+#include "multi_constexpr.h"
 
 class dot11_ie_221_wfa_wpa {
 public:
@@ -38,41 +39,41 @@ public:
     dot11_ie_221_wfa_wpa() { }
     ~dot11_ie_221_wfa_wpa() { }
 
-    static uint32_t ms_wps_oui() {
+    constexpr17 static uint32_t ms_wps_oui() {
         return 0x0050f2;
     }
 
-    static uint8_t wfa_wpa_subtype() {
+    constexpr17 static uint8_t wfa_wpa_subtype() {
         return 0x01;
     }
 
     void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-    uint8_t vendor_subtype() {
+    constexpr17 uint8_t vendor_subtype() const {
         return m_vendor_subtype;
     }
 
-    uint16_t wpa_version() {
+    constexpr17 uint16_t wpa_version() const {
         return m_wpa_version;
     }
 
-    std::shared_ptr<wpa_v1_cipher> multicast_cipher() {
+    std::shared_ptr<wpa_v1_cipher> multicast_cipher() const {
         return m_multicast_cipher;
     }
 
-    uint16_t unicast_count() {
+    constexpr17 uint16_t unicast_count() const {
         return m_unicast_count;
     }
 
-    std::shared_ptr<shared_wpa_v1_cipher_vector> unicast_ciphers() {
+    std::shared_ptr<shared_wpa_v1_cipher_vector> unicast_ciphers() const {
         return m_unicast_ciphers;
     }
 
-    uint16_t akm_count() {
+    constexpr17 uint16_t akm_count() const {
         return m_akm_count;
     }
 
-    std::shared_ptr<shared_wpa_v1_cipher_vector> akm_ciphers() {
+    std::shared_ptr<shared_wpa_v1_cipher_vector> akm_ciphers() const {
         return m_akm_ciphers;
     }
 
@@ -115,11 +116,11 @@ public:
 
         void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-        std::string oui() {
+        std::string oui() const {
             return m_oui;
         }
 
-        uint8_t cipher_type() {
+        constexpr17 uint8_t cipher_type() const {
             return m_cipher_type;
         }
 

@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -29,50 +29,63 @@
 #include "ipc_remote2.h"
 #include "pollabletracker.h"
 
-IPCRemoteV2::IPCRemoteV2(GlobalRegistry *in_globalreg, 
-        std::shared_ptr<BufferHandlerGeneric> in_rbhandler) {
-
-    globalreg = in_globalreg;
+ipc_remote_v2::ipc_remote_v2(global_registry *in_globalreg, 
+        std::shared_ptr<buffer_handler_generic> in_rbhandler) :
+        globalreg {Globalreg::globalreg},
+        tracker_free {false},
+        child_pid {0} {
 
     pollabletracker =
-        std::static_pointer_cast<PollableTracker>(globalreg->FetchGlobal("POLLABLETRACKER"));
+        Globalreg::fetch_mandatory_global_as<pollable_tracker>();
+
+    remotehandler = 
+        Globalreg::fetch_mandatory_global_as<ipc_remote_v2_tracker>();
+
+    tracker_free = false;
+
+    // Inherit the mutex from the rbhandler
+    ipc_mutex = in_rbhandler->get_mutex();
 
     ipchandler = in_rbhandler;
 
-    remotehandler = 
-        std::static_pointer_cast<IPCRemoteV2Tracker>(globalreg->FetchGlobal("IPCHANDLER"));
-
-    if (remotehandler == NULL) {
-        _MSG("IPCRemoteV2 called before IPCRemoteV2Tracker instantiated, cannot track "
-                "IPC binaries.", MSGFLAG_ERROR);
-    }
-
-    ipchandler->SetProtocolErrorCb([this]() {
-        local_locker lock(&ipc_locker);
-        // fprintf(stderr, "debug - ipchandler got protocol error, shutting down pid %u\n", child_pid);
-
+    ipchandler->set_protocol_error_cb([this]() {
         close_ipc();
     });
 
-    child_pid = -1;
-    tracker_free = false;
 }
 
-IPCRemoteV2::~IPCRemoteV2() {
-    local_eol_locker lock(&ipc_locker);
+void ipc_remote_v2::set_mutex(std::shared_ptr<kis_recursive_timed_mutex> in_parent) {
+    if (in_parent == nullptr)
+        in_parent = std::make_shared<kis_recursive_timed_mutex>();
 
-    // fprintf(stderr, "debug - ~ipcremotev2\n");
+    local_locker l(ipc_mutex);
 
-    close_ipc();
+    ipc_mutex = in_parent;
+
+    pipeclient->set_mutex(ipc_mutex);
 }
 
-void IPCRemoteV2::add_path(std::string in_path) {
-    local_locker lock(&ipc_locker);
+ipc_remote_v2::~ipc_remote_v2() {
+    if (pipeclient != nullptr) {
+        pollabletracker->remove_pollable(pipeclient);
+        pipeclient->close_pipes();
+    }
+
+    if (ipchandler != nullptr) {
+        ipchandler->set_protocol_error_cb([]() { });
+        ipchandler->buffer_error("IPC process has closed");
+    }
+
+    hard_kill();
+}
+
+void ipc_remote_v2::add_path(std::string in_path) {
+    local_locker lock(ipc_mutex);
     path_vec.push_back(in_path);
 }
 
-std::string IPCRemoteV2::FindBinaryPath(std::string in_cmd) {
-    local_locker lock(&ipc_locker);
+std::string ipc_remote_v2::FindBinaryPath(std::string in_cmd) {
+    local_locker lock(ipc_mutex);
 
     for (unsigned int x = 0; x < path_vec.size(); x++) {
         std::stringstream path;
@@ -90,38 +103,43 @@ std::string IPCRemoteV2::FindBinaryPath(std::string in_cmd) {
     return "";
 }
 
-void IPCRemoteV2::close_ipc() {
-    // Remove the IPC entry first, we already are shutting down; let the ipc
-    // catcher reap the signal normally, we just don't need to know about it.
-    remotehandler->remove_ipc(this);
+void ipc_remote_v2::close_ipc() {
+    local_locker lock(ipc_mutex);
+
+    if (pipeclient != nullptr) {
+        pollabletracker->remove_pollable(pipeclient);
+        pipeclient->close_pipes();
+    }
+
+    if (ipchandler != nullptr) {
+        ipchandler->set_protocol_error_cb([]() { });
+        ipchandler->buffer_error("IPC process has closed");
+    }
+
+    pipeclient.reset();
+    ipchandler.reset();
 
     hard_kill();
-
-    child_pid = -1;
 }
 
-int IPCRemoteV2::launch_kis_binary(std::string cmd, std::vector<std::string> args) {
+int ipc_remote_v2::launch_kis_binary(std::string cmd, std::vector<std::string> args) {
     std::string fullcmd = FindBinaryPath(cmd);
 
     if (fullcmd == "") {
-        _MSG("IPC could not find binary '" + cmd + "'", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not find binary '{}'", cmd);
         return -1;
     }
 
     return launch_kis_explicit_binary(fullcmd, args);
 }
 
-int IPCRemoteV2::launch_kis_explicit_binary(std::string cmdpath, std::vector<std::string> args) {
+int ipc_remote_v2::launch_kis_explicit_binary(std::string cmdpath, std::vector<std::string> args) {
     struct stat buf;
     char **cmdarg;
     std::stringstream arg;
 
-    if (pipeclient != NULL) {
-        soft_kill();
-    }
-
     if (stat(cmdpath.c_str(), &buf) < 0) {
-        _MSG("IPC could not find binary '" + cmdpath + "'", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not find binary '{}", cmdpath);
         return -1;
     }
 
@@ -149,11 +167,11 @@ int IPCRemoteV2::launch_kis_explicit_binary(std::string cmdpath, std::vector<std
                 }
 
                 if (!group_ok) {
-                    _MSG("IPC cannot run binary '" + cmdpath + "', Kismet was installed "
+                    _MSG_ERROR("IPC cannot run binary '{}', Kismet was installed "
                             "setgid and you are not in that group. If you recently added your "
                             "user to the kismet group, you will need to log out and back in to "
                             "activate it.  You can check your groups with the 'groups' command.",
-                            MSGFLAG_ERROR);
+                            cmdpath);
                     return -1;
                 }
             }
@@ -163,7 +181,7 @@ int IPCRemoteV2::launch_kis_explicit_binary(std::string cmdpath, std::vector<std
     // We can't use a local_locker here because we can't let it unlock
     // inside the child thread, because the mutex doesn't survive across
     // forking
-    local_eol_locker ilock(&ipc_locker);
+    local_eol_locker ilock(ipc_mutex);
 
     // 'in' to the spawned process, write to the server process, 
     // [1] belongs to us, [0] to them
@@ -174,78 +192,52 @@ int IPCRemoteV2::launch_kis_explicit_binary(std::string cmdpath, std::vector<std
 
 #ifdef HAVE_PIPE2
     if (pipe2(inpipepair, O_NONBLOCK) < 0) {
-        _MSG("IPC could not create pipe", MSGFLAG_ERROR);
-        local_unlocker ulock(&ipc_locker);
+        _MSG_ERROR("IPC could not create pipe: {}", kis_strerror_r(errno));
+        local_unlocker ulock(ipc_mutex);
         return -1;
     }
 
     if (pipe2(outpipepair, O_NONBLOCK) < 0) {
-        _MSG("IPC could not create pipe", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not create pipe: {}", kis_strerror_r(errno));
         close(inpipepair[0]);
         close(inpipepair[1]);
-        local_unlocker ulock(&ipc_locker);
+        local_unlocker ulock(ipc_mutex);
         return -1;
     }
 #else
     if (pipe(inpipepair) < 0) {
-        _MSG("IPC could not create pipe", MSGFLAG_ERROR);
-        local_unlocker ulock(&ipc_locker);
+        _MSG_ERROR("IPC could not create pipe: {}", kis_strerror_r(errno));
+        local_unlocker ulock(ipc_mutex);
         return -1;
     }
     fcntl(inpipepair[0], F_SETFL, fcntl(inpipepair[0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(inpipepair[1], F_SETFL, fcntl(inpipepair[1], F_GETFL, 0) | O_NONBLOCK);
 
     if (pipe(outpipepair) < 0) {
-        _MSG("IPC could not create pipe", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not create pipe: {}", kis_strerror_r(errno));
         close(inpipepair[0]);
         close(inpipepair[1]);
-        local_unlocker ulock(&ipc_locker);
+        local_unlocker ulock(ipc_mutex);
         return -1;
     }
     fcntl(outpipepair[0], F_SETFL, fcntl(outpipepair[0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(outpipepair[1], F_SETFL, fcntl(outpipepair[1], F_GETFL, 0) | O_NONBLOCK);
 
 #endif
-    
-    // Mask sigchild until we're done and it's in the list
-    sigset_t mask, oldmask;
 
-    sigemptyset(&mask);
-    sigemptyset(&oldmask);
-
-    sigaddset(&mask, SIGCHLD);
-
-    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+    // We don't need to do signal masking because we run a dedicated signal handling thread
 
     if ((child_pid = fork()) < 0) {
-        _MSG("IPC could not fork()", MSGFLAG_ERROR);
-        local_unlocker ulock(&ipc_locker);
+        _MSG_ERROR("IPC could not fork(): {}", kis_strerror_r(errno));
+        local_unlocker ulock(ipc_mutex);
     } else if (child_pid == 0) {
         // We're the child process
+
+        // Unblock all signals in the child so nothing carries over from the parent fork
+        sigset_t unblock_mask;
+        sigfillset(&unblock_mask);
+        pthread_sigmask(SIG_UNBLOCK, &unblock_mask, nullptr);
       
-#if 0
-        cmdarg = new char*[args.size() + 8];
-
-        cmdarg[0] = strdup("valgrind");
-        cmdarg[1] = strdup("--tool=memcheck");
-        cmdarg[2] = strdup("--leak-check=full");
-        cmdarg[3] = strdup("--show-leak-kinds=all");
-        cmdarg[4] = strdup(cmdpath.c_str());
-
-        // Child reads from inpair
-        arg << "--in-fd=" << inpipepair[0];
-        cmdarg[5] = strdup(arg.str().c_str());
-        arg.str("");
-
-        // Child writes to writepair
-        arg << "--out-fd=" << outpipepair[1];
-        cmdarg[6] = strdup(arg.str().c_str());
-
-        for (unsigned int x = 0; x < args.size(); x++)
-            cmdarg[x+7] = strdup(args[x].c_str());
-
-        cmdarg[args.size() + 7] = NULL;
-#else
         // argv[0], "--in-fd" "--out-fd" ... NULL
         cmdarg = new char*[args.size() + 4];
         cmdarg[0] = strdup(cmdpath.c_str());
@@ -263,65 +255,61 @@ int IPCRemoteV2::launch_kis_explicit_binary(std::string cmdpath, std::vector<std
             cmdarg[x+3] = strdup(args[x].c_str());
 
         cmdarg[args.size() + 3] = NULL;
-#endif
 
-        // Close the unused half of the pairs on the child
+        // close the unused half of the pairs on the child
         close(inpipepair[1]);
         close(outpipepair[0]);
-
-        // Un-mask the child signals
-        sigprocmask(SIG_UNBLOCK, &mask, &oldmask);
 
         // fprintf(stderr, "debug - ipcremote2 - exec %s\n", cmdarg[0]);
         execvp(cmdarg[0], cmdarg);
 
         exit(255);
     } 
+
+    // fprintf(stderr, "forked, child pid %d\n", child_pid);
    
     // Parent process
    
     // fprintf(stderr, "debug - ipcremote2 creating pipeclient\n");
-
-    pipeclient.reset(new PipeClient(globalreg, ipchandler));
-
-    pollabletracker->RegisterPollable(pipeclient);
-
-    // Read from the child write pair, write to the child read pair
-    pipeclient->OpenPipes(outpipepair[0], inpipepair[1]);
-
-    // Close the remote side of the pipes from the parent, they're open in the child
+    
+    
+    // close the remote side of the pipes from the parent, they're open in the child
     close(inpipepair[0]);
     close(outpipepair[1]);
+
+    if (pipeclient != NULL) {
+        soft_kill();
+    }
+
+    pipeclient.reset(new pipe_client(globalreg, ipchandler));
+
+    // Read from the child write pair, write to the child read pair
+    pipeclient->open_pipes(outpipepair[0], inpipepair[1]);
+
+    pollabletracker->register_pollable(pipeclient);
 
     binary_path = cmdpath;
     binary_args = args;
 
-    if (remotehandler != NULL) {
-        remotehandler->add_ipc(this);
-    }
-
     {
-        local_unlocker ulock(&ipc_locker);
+        local_unlocker ulock(ipc_mutex);
     }
-
-    // Unmask the child signal now that we're done
-    sigprocmask(SIG_UNBLOCK, &mask, &oldmask);
 
     return 1;
 }
 
-int IPCRemoteV2::launch_standard_binary(std::string cmd, std::vector<std::string> args) {
+int ipc_remote_v2::launch_standard_binary(std::string cmd, std::vector<std::string> args) {
     std::string fullcmd = FindBinaryPath(cmd);
 
     if (fullcmd == "") {
-        _MSG("IPC could not find binary '" + cmd + "'", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not find binary '{}'", cmd);
         return -1;
     }
 
     return launch_standard_explicit_binary(fullcmd, args);
 }
 
-int IPCRemoteV2::launch_standard_explicit_binary(std::string cmdpath, std::vector<std::string> args) {
+int ipc_remote_v2::launch_standard_explicit_binary(std::string cmdpath, std::vector<std::string> args) {
     struct stat buf;
     char **cmdarg;
     std::stringstream arg;
@@ -331,19 +319,19 @@ int IPCRemoteV2::launch_standard_explicit_binary(std::string cmdpath, std::vecto
     }
 
     if (stat(cmdpath.c_str(), &buf) < 0) {
-        _MSG("IPC could not find binary '" + cmdpath + "'", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not find binary '{}'", cmdpath);
         return -1;
     }
 
     if (!(buf.st_mode & S_IXUSR)) {
-        _MSG("IPC could not find binary '" + cmdpath + "'", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not find binary '{}'", cmdpath);
         return -1;
     }
 
     // We can't use a local_locker here because we can't let it unlock
     // inside the child thread, because the mutex doesn't survive across
     // forking
-    local_eol_locker elock(&ipc_locker);
+    local_eol_locker elock(ipc_mutex);
 
     // 'in' to the spawned process, [0] belongs to us, [1] to them
     int inpipepair[2];
@@ -351,35 +339,32 @@ int IPCRemoteV2::launch_standard_explicit_binary(std::string cmdpath, std::vecto
     int outpipepair[2];
 
     if (pipe(inpipepair) < 0) {
-        _MSG("IPC could not create pipe", MSGFLAG_ERROR);
-        local_unlocker ulock(&ipc_locker);
+        _MSG_ERROR("IPC could not create pipe: {}", kis_strerror_r(errno));
+        local_unlocker ulock(ipc_mutex);
         return -1;
     }
 
     if (pipe(outpipepair) < 0) {
-        _MSG("IPC could not create pipe", MSGFLAG_ERROR);
+        _MSG_ERROR("IPC could not create pipe: {}", kis_strerror_r(errno));
         close(inpipepair[0]);
         close(inpipepair[1]);
-        local_unlocker ulock(&ipc_locker);
+        local_unlocker ulock(ipc_mutex);
         return -1;
     }
 
-    // Mask sigchild until we're done and it's in the list
-    sigset_t mask, oldmask;
-
-    sigemptyset(&mask);
-    sigemptyset(&oldmask);
-
-    sigaddset(&mask, SIGCHLD);
-
-    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+    // We don't do signal masking because we run a dedicated signal handling thread
 
     if ((child_pid = fork()) < 0) {
-        _MSG("IPC could not fork()", MSGFLAG_ERROR);
-        local_unlocker ulock(&ipc_locker);
+        _MSG_ERROR("IPC could not fork(): {}", kis_strerror_r(errno));
+        local_unlocker ulock(ipc_mutex);
     } else if (child_pid == 0) {
         // We're the child process
         
+        // Unblock all signals in the child so nothing carries over from the parent fork
+        sigset_t unblock_mask;
+        sigfillset(&unblock_mask);
+        pthread_sigmask(SIG_UNBLOCK, &unblock_mask, nullptr);
+
         // argv[0], "--in-fd" "--out-fd" ... NULL
         cmdarg = new char*[args.size() + 1];
         cmdarg[0] = strdup(cmdpath.c_str());
@@ -393,7 +378,7 @@ int IPCRemoteV2::launch_standard_explicit_binary(std::string cmdpath, std::vecto
         dup2(inpipepair[0], STDIN_FILENO);
         dup2(outpipepair[1], STDOUT_FILENO);
 
-        // Close the remote side of the pipes
+        // close the remote side of the pipes
         close(inpipepair[0]);
         close(outpipepair[1]);
 
@@ -404,147 +389,185 @@ int IPCRemoteV2::launch_standard_explicit_binary(std::string cmdpath, std::vecto
 
     // Only reach here if we're the parent process
     
-    // Close the remote side of the pipes
+    // close the remote side of the pipes
     close(inpipepair[1]);
     close(outpipepair[0]);
 
-    pipeclient.reset(new PipeClient(globalreg, ipchandler));
+    pipeclient.reset(new pipe_client(globalreg, ipchandler));
 
-    pollabletracker->RegisterPollable(pipeclient);
+    pollabletracker->register_pollable(pipeclient);
 
     // We read from the read end of the out pair, and write to the write end of the in
     // pair.  Confused?
-    pipeclient->OpenPipes(outpipepair[0], inpipepair[1]);
+    pipeclient->open_pipes(outpipepair[0], inpipepair[1]);
 
     binary_path = cmdpath;
     binary_args = args;
 
-    if (remotehandler != NULL) {
-        remotehandler->add_ipc(this);
-    }
-
     {
-        local_unlocker ulock(&ipc_locker);
+        local_unlocker ulock(ipc_mutex);
     }
-
-    // Unmask the child signal now that we're done
-    sigprocmask(SIG_UNBLOCK, &mask, &oldmask);
 
     return 1;
 }
 
-pid_t IPCRemoteV2::get_pid() {
-    local_locker lock(&ipc_locker);
+pid_t ipc_remote_v2::get_pid() {
     return child_pid;
 }
 
-void IPCRemoteV2::set_tracker_free(bool in_free) {
-    local_locker lock(&ipc_locker);
+void ipc_remote_v2::set_tracker_free(bool in_free) {
+    local_locker lock(ipc_mutex);
     tracker_free = in_free;
 }
 
-int IPCRemoteV2::soft_kill() {
-    local_locker lock(&ipc_locker);
+int ipc_remote_v2::soft_kill() {
+    local_locker lock(ipc_mutex);
 
-    // fprintf(stderr, "debug - IPCRemoteV2 soft_kill %d ipeclient != null, removing pollable and closing pipes\n", child_pid);
-    if (pipeclient != NULL) {
-        pollabletracker->RemovePollable(pipeclient);
-        pipeclient->ClosePipes();
+    if (pipeclient != nullptr) {
+        pollabletracker->remove_pollable(pipeclient);
+        pipeclient->close_pipes();
     }
 
     if (child_pid <= 0)
         return -1;
 
-    // fprintf(stderr, "debug - sending sigterm to %d\n", child_pid);
     return kill(child_pid, SIGTERM);
 }
 
-int IPCRemoteV2::hard_kill() {
-    local_locker lock(&ipc_locker);
+int ipc_remote_v2::hard_kill() {
+    local_locker lock(ipc_mutex);
 
-    // fprintf(stderr, "debug - IPCRemoteV2 hard_kill %d pipeclient != null, removing pollable and closing pipes\n", child_pid);
-    if (pipeclient != NULL) {
-        pollabletracker->RemovePollable(pipeclient);
-        pipeclient->ClosePipes();
+    if (pipeclient != nullptr) {
+        pollabletracker->remove_pollable(pipeclient);
+        pipeclient->close_pipes();
     }
 
-    if (child_pid <= 0)
+    if (child_pid <= 0) {
         return -1;
+    }
 
     return kill(child_pid, SIGKILL);
 }
 
-void IPCRemoteV2::notify_killed(int in_exit) {
+void ipc_remote_v2::notify_killed(int in_exit) {
+    local_locker l(ipc_mutex);
+
     std::stringstream ss;
 
-    // fprintf(stderr, "debug - ipcremote2 notify_killed\n");
-
-    if (ipchandler != NULL) {
-        ss << "IPC process '" << binary_path << "' " << child_pid << " exited, " <<
-            in_exit;
-
-        ipchandler->BufferError(ss.str());
+    // Pull anything left in the buffer and process it
+    if (pipeclient != nullptr) {
+        pipeclient->flush_read();
     }
 
-    child_pid = 0;
+    if (ipchandler != nullptr) {
+        ss << "IPC process '" << binary_path << "' " << child_pid << " exited, " << in_exit;
+        ipchandler->buffer_error(ss.str());
+    }
+
     close_ipc();
 }
 
-IPCRemoteV2Tracker::IPCRemoteV2Tracker(GlobalRegistry *in_globalreg) {
+ipc_remote_v2_tracker::ipc_remote_v2_tracker(global_registry *in_globalreg) {
+    ipc_mutex.set_name("ipc_remote_v2_tracker");
+
     globalreg = in_globalreg;
 
     timer_id = 
-        globalreg->timetracker->RegisterTimer(SERVER_TIMESLICES_SEC, NULL, 1, this);
+        globalreg->timetracker->register_timer(SERVER_TIMESLICES_SEC, NULL, 1, this);
+    cleanup_timer_id = -1;
 }
 
-IPCRemoteV2Tracker::~IPCRemoteV2Tracker() {
-    local_eol_locker lock(&ipc_locker);
-
+ipc_remote_v2_tracker::~ipc_remote_v2_tracker() {
     globalreg->RemoveGlobal("IPCHANDLER");
 
-    globalreg->timetracker->RemoveTimer(timer_id);
+    globalreg->timetracker->remove_timer(timer_id);
+    globalreg->timetracker->remove_timer(cleanup_timer_id);
 }
 
-void IPCRemoteV2Tracker::add_ipc(IPCRemoteV2 *in_remote) {
-    local_locker lock(&ipc_locker);
+void ipc_remote_v2_tracker::add_ipc(std::shared_ptr<ipc_remote_v2> in_remote) {
+    local_locker lock(&ipc_mutex);
+
+    if (in_remote == nullptr) {
+        // fmt::print(stderr, "debug - tried to add null remote\n");
+        return;
+    }
+
+    if (in_remote->get_pid() <= 0) {
+        // fmt::print(stderr, "debug - tried to add ipc proc w/ no pid\n");
+        return;
+    }
+
+    for (auto r : process_vec) {
+        if (r->get_pid() == in_remote->get_pid()) {
+            // fmt::print(stderr, "debug - ipc tried to add process {} but already extant\n");
+            return;
+        }
+    }
 
     process_vec.push_back(in_remote);
+
+    // fmt::print(stderr, "debug - + ipc {} process vec {}\n", in_remote->get_pid(), process_vec.size());
 }
 
-IPCRemoteV2 *IPCRemoteV2Tracker::remove_ipc(IPCRemoteV2 *in_remote) {
-    local_locker lock(&ipc_locker);
+std::shared_ptr<ipc_remote_v2> ipc_remote_v2_tracker::remove_ipc(ipc_remote_v2 *in_remote) {
+    local_locker lock(&ipc_mutex);
 
-    IPCRemoteV2 *ret = NULL;
+    std::shared_ptr<ipc_remote_v2> ret;
 
     for (unsigned int x = 0; x < process_vec.size(); x++) {
-        if (process_vec[x] == in_remote) {
+        if (process_vec[x].get() == in_remote) {
             ret = process_vec[x];
+            // fmt::print(stderr, "debug - ipc removing by ptr pid {}\n", ret->get_pid());
+            cleanup_vec.push_back(ret);
             process_vec.erase(process_vec.begin() + x);
             break;
         }
     }
 
+    // fmt::print(stderr, "debug - ipc schedule cleanup process vec {}\n", process_vec.size());
+    schedule_cleanup();
+
     return ret;
 }
 
-IPCRemoteV2 *IPCRemoteV2Tracker::remove_ipc(pid_t in_pid) {
-    local_locker lock(&ipc_locker);
+void ipc_remote_v2_tracker::schedule_cleanup() {
+    if (cleanup_timer_id > 0)
+        return;
 
-    IPCRemoteV2 *ret = NULL;
+    cleanup_timer_id = 
+        Globalreg::globalreg->timetracker->register_timer(2, NULL, 0, 
+                [this] (int) -> int {
+                    local_locker lock(&ipc_mutex);
+                    cleanup_vec.clear();
+                    cleanup_timer_id = 0;
+                    return 0;
+                });
+
+}
+
+std::shared_ptr<ipc_remote_v2> ipc_remote_v2_tracker::remove_ipc(pid_t in_pid) {
+    local_locker lock(&ipc_mutex);
+
+    std::shared_ptr<ipc_remote_v2> ret;
 
     for (unsigned int x = 0; x < process_vec.size(); x++) {
         if (process_vec[x]->get_pid() == in_pid) {
             ret = process_vec[x];
+            // fmt::print(stderr, "debug - ipc removing by pid {}\n", ret->get_pid());
+            cleanup_vec.push_back(ret);
             process_vec.erase(process_vec.begin() + x);
             break;
         }
     }
 
+    // fmt::print(stderr, "debug - ipc schedule cleanup process vec {}\n", process_vec.size());
+    schedule_cleanup();
+
     return ret;
 }
 
-void IPCRemoteV2Tracker::kill_all_ipc(bool in_hardkill) {
-    local_locker lock(&ipc_locker);
+void ipc_remote_v2_tracker::kill_all_ipc(bool in_hardkill) {
+    local_locker lock(&ipc_mutex);
 
     // Leave everything in the vec until we properly reap it, we might
     // need to go back and kill it again
@@ -556,7 +579,7 @@ void IPCRemoteV2Tracker::kill_all_ipc(bool in_hardkill) {
     }
 }
 
-int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_delay) {
+int ipc_remote_v2_tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_delay) {
     // We can't immediately lock since killall will need to
 
     // Soft-kill every process
@@ -568,17 +591,10 @@ int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_dela
     // use our own timer, but that's a hassle and this only happens during
     // shutdown.  We do a spin on waitpid instead.
 
-    sigset_t mask, oldmask;
-    sigemptyset(&mask);
-    sigemptyset(&oldmask);
-
-    sigaddset(&mask, SIGCHLD);
-    sigprocmask(SIG_BLOCK, &mask, &oldmask);
-
     while (1) {
         int pid_status;
         pid_t caught_pid;
-        IPCRemoteV2 *killed_remote = NULL;
+        std::shared_ptr<ipc_remote_v2> killed_remote;
 
         caught_pid = waitpid(-1, &pid_status, WNOHANG);
 
@@ -588,13 +604,13 @@ int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_dela
             killed_remote = remove_ipc(caught_pid);
 
             // TODO decide if we're going to delete the IPC handler too
-            if (killed_remote != NULL) {
+            if (killed_remote != nullptr) {
                 killed_remote->notify_killed(WEXITSTATUS(pid_status)); 
             }
         } else {
             // Sleep if we haven't caught anything, otherwise spin to catch all
             // pending processes
-            usleep(1000);
+            usleep(100);
         }
 
         if (time(0) - start_time > in_soft_delay)
@@ -604,7 +620,7 @@ int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_dela
     bool vector_empty = true;
 
     {
-        local_locker lock(&ipc_locker);
+        local_locker lock(&ipc_mutex);
         if (process_vec.size() > 0)
             vector_empty = false;
     }
@@ -623,7 +639,7 @@ int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_dela
         while (1) {
             int pid_status;
             pid_t caught_pid;
-            IPCRemoteV2 *killed_remote = NULL;
+            std::shared_ptr<ipc_remote_v2> killed_remote;
 
             caught_pid = waitpid(-1, &pid_status, WNOHANG);
 
@@ -647,12 +663,10 @@ int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_dela
     }
 
     {
-        local_locker lock(&ipc_locker);
+        local_locker lock(&ipc_mutex);
         if (process_vec.size() > 0)
             vector_empty = false;
     }
-
-    sigprocmask(SIG_BLOCK, &mask, &oldmask);
 
     if (vector_empty)
         return 0;
@@ -660,48 +674,50 @@ int IPCRemoteV2Tracker::ensure_all_ipc_killed(int in_soft_delay, int in_max_dela
     return -1;
 }
 
-int IPCRemoteV2Tracker::timetracker_event(int event_id __attribute__((unused))) {
+int ipc_remote_v2_tracker::timetracker_event(int event_id __attribute__((unused))) {
     std::stringstream str;
-    IPCRemoteV2 *dead_remote = NULL;
+    std::shared_ptr<ipc_remote_v2> dead_remote;
 
-    // Turn off sigchild while we process the list
-    sigset_t mask, oldmask;
+    int pid_status;
+    pid_t caught_pid;
 
-    sigemptyset(&mask);
-    sigemptyset(&oldmask);
+    if (globalreg->reap_child_procs) {
+        globalreg->reap_child_procs = false;
 
-    sigaddset(&mask, SIGCHLD);
-    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+        while ((caught_pid = waitpid(-1, &pid_status, WNOHANG | WUNTRACED)) > 0) {
+            // Find the IPC record for this remote
+            dead_remote = remove_ipc(caught_pid);
 
-    for (unsigned int x = 0; x < 1024 && x < globalreg->sigchild_vec_pos; x++) {
-        pid_t caught_pid = globalreg->sigchild_vec[x];
-
-        dead_remote = remove_ipc(caught_pid);
-
-        if (dead_remote != NULL) {
-            dead_remote->notify_killed(0);
-            dead_remote->close_ipc();
-
-            if (dead_remote->get_tracker_free()) {
-                str.str("");
-                str << "Deleting tracked IPC for " << dead_remote->get_pid();
-                _MSG(str.str(), MSGFLAG_INFO);
+            // Kill it
+            if (dead_remote != nullptr) {
+                dead_remote->notify_killed(0);
+                dead_remote->close_ipc();
             }
-        } else {
-            /* We don't care, and having initiated a shutdown we'll already have
-             * removed the source.
-             *
-            str << "IPC child pid " << caught_pid << " exited with status " <<
-                WEXITSTATUS(pid_status) << " but was not tracked";
-            _MSG(str.str(), MSGFLAG_INFO);
-            */
         }
-
     }
 
-    globalreg->sigchild_vec_pos = 0;
+    // fmt::print(stderr, "debug - process vec size {}\n", process_vec.size());
+    for (auto p : process_vec) {
+        if (p == nullptr)
+            continue;
 
-    sigprocmask(SIG_UNBLOCK, &mask, &oldmask);
+        // fmt::print(stderr, "PROC {}\n", p->get_pid());
+        
+        caught_pid = waitpid(p->get_pid(), &pid_status, WNOHANG | WUNTRACED);
+
+        if (caught_pid < 0) {
+            // fmt::print(stderr, "debug - looks like we missed pid {} somehow, removing\n", p->get_pid());
+
+            // Find the IPC record for this remote
+            dead_remote = remove_ipc(p->get_pid());
+
+            // Kill it
+            if (dead_remote != nullptr) {
+                dead_remote->notify_killed(0);
+                dead_remote->close_ipc();
+            }
+        }
+    }
 
     return 1;
 }

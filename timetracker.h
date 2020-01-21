@@ -37,15 +37,18 @@
 // For ubertooth and a few older plugins that compile against both svn and old
 #define KIS_NEW_TIMER_PARM	1
 
-#define TIMEEVENT_PARMS Timetracker::timer_event *evt __attribute__ ((unused)), \
-    void *auxptr __attribute__ ((unused)), GlobalRegistry *globalreg __attribute__ ((unused))
+#define TIMEEVENT_PARMS time_tracker::timer_event *evt __attribute__ ((unused)), \
+    void *auxptr __attribute__ ((unused)), global_registry *globalreg __attribute__ ((unused))
 
-class TimetrackerEvent;
+class time_tracker_event;
 
-class Timetracker : public LifetimeGlobal {
+class time_tracker : public lifetime_global {
 public:
     struct timer_event {
         int timer_id;
+
+        // Is the timer cancelled?
+        std::atomic<bool> timer_cancelled;
 
         // Time it was scheduled
         struct timeval schedule_tm;
@@ -58,21 +61,21 @@ public:
         int recurring;
 
         // Event, if we were passed a class
-        TimetrackerEvent *event;
+        time_tracker_event *event;
 
         // Function if we were passed a lambda
         std::function<int (int)> event_func;
 
         // C function, if we weren't
-        int (*callback)(timer_event *, void *, GlobalRegistry *);
+        int (*callback)(timer_event *, void *, global_registry *);
         void *callback_parm;
     };
 
     // Sort alerts by alert trigger time
     class SortTimerEventsTrigger {
     public:
-        inline bool operator() (const Timetracker::timer_event *x, 
-								const Timetracker::timer_event *y) const {
+        inline bool operator() (const time_tracker::timer_event *x, 
+								const time_tracker::timer_event *y) const {
             if ((x->trigger_tm.tv_sec < y->trigger_tm.tv_sec) ||
                 ((x->trigger_tm.tv_sec == y->trigger_tm.tv_sec) && 
 				 (x->trigger_tm.tv_usec < y->trigger_tm.tv_usec)))
@@ -82,60 +85,64 @@ public:
         }
     };
 
-    static std::shared_ptr<Timetracker> create_timetracker(GlobalRegistry *in_globalreg) {
-        std::shared_ptr<Timetracker> mon(new Timetracker(in_globalreg));
-        in_globalreg->timetracker = mon.get();
-        in_globalreg->RegisterLifetimeGlobal(mon);
-        in_globalreg->InsertGlobal("TIMETRACKER", mon);
+    static std::string global_name() { return "TIMETRACKER"; }
+
+    static std::shared_ptr<time_tracker> create_timetracker() {
+        std::shared_ptr<time_tracker> mon(new time_tracker());
+        Globalreg::globalreg->timetracker = mon.get();
+        Globalreg::globalreg->register_lifetime_global(mon);
+        Globalreg::globalreg->insert_global(global_name(), mon);
         return mon;
     }
+
 private:
-    Timetracker(GlobalRegistry *in_globalreg);
+    time_tracker();
 
 public:
-    virtual ~Timetracker();
-
-    // Tick and handle timers
-    int Tick();
+    virtual ~time_tracker();
 
     // Register an optionally recurring timer.  Slices are 1/100th of a second,
     // the smallest linux can slice without getting into weird calls.
-    int RegisterTimer(int in_timeslices, struct timeval *in_trigger,
+    int register_timer(int in_timeslices, struct timeval *in_trigger,
                       int in_recurring, 
-                      int (*in_callback)(timer_event *, void *, GlobalRegistry *),
+                      int (*in_callback)(timer_event *, void *, global_registry *),
                       void *in_parm);
 
-    int RegisterTimer(int timeslices, struct timeval *in_trigger,
-            int in_recurring, TimetrackerEvent *event);
+    int register_timer(int timeslices, struct timeval *in_trigger,
+            int in_recurring, time_tracker_event *event);
 
-    int RegisterTimer(int timeslices, struct timeval *in_trigger,
+    int register_timer(int timeslices, struct timeval *in_trigger,
             int in_recurring, std::function<int (int)> event);
 
     // Remove a timer that's going to execute
-    int RemoveTimer(int timer_id);
+    int remove_timer(int timer_id);
+
+    void Tick();
+
+    void SpawnTimetrackerThread();
 
 protected:
-    GlobalRegistry *globalreg;
-
     kis_recursive_timed_mutex time_mutex;
 
-    // Nonblocking versions
-    int RegisterTimer_nb(int in_timeslices, struct timeval *in_trigger,
-                      int in_recurring, 
-                      int (*in_callback)(timer_event *, void *, GlobalRegistry *),
-                      void *in_parm);
-    int RegisterTimer_nb(int timeslices, struct timeval *in_trigger,
-            int in_recurring, TimetrackerEvent *event);
-    int RegisterTimer_nb(int timeslices, struct timeval *in_trigger,
-            int in_recurring, std::function<int (int)> event);
-    int RemoveTimer_nb(int timer_id);
+    void time_dispatcher(void);
 
-    int next_timer_id;
+    // Do we have to re-sort the list of timers?
+    std::atomic<bool> timer_sort_required;
+
+    // Next timer ID to be assigned
+    std::atomic<int> next_timer_id;
+
     std::map<int, timer_event *> timer_map;
     std::vector<timer_event *> sorted_timers;
+
+    kis_recursive_timed_mutex removed_id_mutex;
+    std::vector<int> removed_timer_ids;
+
+    std::thread time_dispatch_t;
+    std::atomic<bool> shutdown;
 };
 
-class TimetrackerEvent {
+class time_tracker_event {
 public:
     // Called when event triggers
     virtual int timetracker_event(int event_id __attribute__ ((unused))) { return 0; };

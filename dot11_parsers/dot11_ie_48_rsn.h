@@ -32,6 +32,7 @@
 #include <memory>
 #include <vector>
 #include <kaitai/kaitaistream.h>
+#include "multi_constexpr.h"
 
 class dot11_ie_48_rsn {
 public:
@@ -46,28 +47,56 @@ public:
 
     void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-    uint16_t rsn_version() {
+    constexpr17 uint16_t rsn_version() const {
         return m_rsn_version;
     }
 
-    std::shared_ptr<dot11_ie_48_rsn_rsn_cipher> group_cipher() {
+    std::shared_ptr<dot11_ie_48_rsn_rsn_cipher> group_cipher() const {
         return m_group_cipher;
     }
 
-    uint16_t pairwise_count() {
+    constexpr17 uint16_t pairwise_count() const {
         return m_pairwise_count;
     }
 
-    std::shared_ptr<shared_rsn_cipher_vector> pairwise_ciphers() {
+    std::shared_ptr<shared_rsn_cipher_vector> pairwise_ciphers() const {
         return m_pairwise_ciphers;
     }
 
-    uint16_t akm_count() {
+    constexpr17 uint16_t akm_count() const {
         return m_akm_count;
     }
 
-    std::shared_ptr<shared_rsn_management_vector> akm_ciphers() {
+    std::shared_ptr<shared_rsn_management_vector> akm_ciphers() const {
         return m_akm_ciphers;
+    }
+
+    constexpr17 uint16_t rsn_capabilities() const {
+        return m_rsn_capabilities;
+    }
+
+    constexpr17 bool rsn_capability_preauth() const {
+        return rsn_capabilities() & 0x01;
+    }
+
+    constexpr17 bool rsn_capability_wep_pairwise() const {
+        return rsn_capabilities() & 0x02;
+    }
+
+    constexpr17 uint8_t rsn_capability_ptksa_replay() const {
+        return (rsn_capabilities() & 0x0C) >> 2;
+    }
+
+    constexpr17 uint8_t rsn_capability_gtksa_replay() const {
+        return (rsn_capabilities() & 0x30) >> 4;
+    }
+
+    constexpr17 bool rsn_capability_mfp_required() const {
+        return (rsn_capabilities() & 0x40);
+    }
+
+    constexpr17 bool rsn_capability_mfp_supported() const {
+        return (rsn_capabilities() & 0x80);
     }
 
 protected:
@@ -77,6 +106,7 @@ protected:
     std::shared_ptr<shared_rsn_cipher_vector> m_pairwise_ciphers;
     uint16_t m_akm_count;
     std::shared_ptr<shared_rsn_management_vector> m_akm_ciphers;
+    uint16_t m_rsn_capabilities;
 
 public:
     class dot11_ie_48_rsn_rsn_cipher {
@@ -99,11 +129,11 @@ public:
 
         void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-        std::string cipher_suite_oui() {
+        std::string cipher_suite_oui() const {
             return m_cipher_suite_oui;
         }
 
-        rsn_cipher_type cipher_type() {
+        constexpr17 rsn_cipher_type cipher_type() const {
             return (rsn_cipher_type) m_cipher_type;
         }
 
@@ -123,7 +153,8 @@ public:
             mgmt_ft_psk = 4,
             mgmt_wpa_sha256 = 5,
             mgmt_psk_sha256 = 6,
-            mgmt_tdls_tpk = 7
+            mgmt_tdls_tpk = 7,
+            mgmt_sae = 8
         };
 
         dot11_ie_48_rsn_rsn_management() { }
@@ -131,11 +162,11 @@ public:
 
         void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-        std::string management_suite_oui() {
+        std::string management_suite_oui() const {
             return m_management_suite_oui;
         }
 
-        rsn_management management_type() {
+        constexpr17 rsn_management management_type() const {
             return (rsn_management) m_management_type;
         }
 
@@ -153,15 +184,15 @@ public:
 
     void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-    uint16_t rsn_version() {
+    constexpr17 uint16_t rsn_version() const {
         return m_rsn_version;
     }
 
-    std::string group_cipher() {
+    std::string group_cipher() const {
         return m_group_cipher;
     }
 
-    uint16_t pairwise_count() {
+    constexpr17 uint16_t pairwise_count() const {
         return m_pairwise_count;
     }
 

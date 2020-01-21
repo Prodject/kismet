@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -28,14 +28,24 @@
 #include "packetchain.h"
 #include "kis_dlt.h"
 
-class Kis_DLT_PPI : public Kis_DLT_Handler {
+class kis_dlt_ppi : public kis_dlt_handler {
 public:
-	Kis_DLT_PPI() { fprintf(stderr, "FATAL OOPS: Kis_DLT_PPI()\n"); exit(1); }
-	Kis_DLT_PPI(GlobalRegistry *in_globalreg);
+    static std::string global_name() { return "DLT_PPI"; }
 
-	virtual int HandlePacket(kis_packet *in_pack);
+    static std::shared_ptr<kis_dlt_ppi> create_dlt() {
+        std::shared_ptr<kis_dlt_ppi> mon(new kis_dlt_ppi());
+        Globalreg::globalreg->register_lifetime_global(mon);
+        Globalreg::globalreg->insert_global(global_name(), mon);
+        return mon;
+    }
 
-	~Kis_DLT_PPI();
+private:
+	kis_dlt_ppi();
+
+public:
+	virtual ~kis_dlt_ppi() { };
+
+	virtual int handle_packet(kis_packet *in_pack);
 };
 
 #endif

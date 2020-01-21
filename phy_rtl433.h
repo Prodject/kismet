@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -28,18 +28,6 @@
 #include "phyhandler.h"
 #include "kismet_json.h"
 
-class packet_info_rtl433 : public packet_component {
-public:
-    packet_info_rtl433(Json::Value in_json) {
-        json = in_json;
-        self_destruct = 1;
-    }
-
-    virtual ~packet_info_rtl433() { }
-
-    Json::Value json;
-};
-
 /* Similar to the extreme aggregator, a temperature aggregator which ignores empty
  * slots while aggregating and otherwise selects the most extreme value when a 
  * slot overlaps.  This fits a lot of generic situations in RTL433 sensors which
@@ -49,6 +37,12 @@ class rtl433_empty_aggregator {
 public:
     // Select the most extreme value
     static int64_t combine_element(const int64_t a, const int64_t b) {
+        if (a == default_val())
+            return b;
+
+        if (b == default_val())
+            return a;
+
         if (a < 0 && b < 0) {
             if (a < b)
                 return a;
@@ -71,17 +65,13 @@ public:
     }
 
     // Simple average
-    static int64_t combine_vector(SharedTrackerElement e) {
-        TrackerElementVector v(e);
-
+    static int64_t combine_vector(std::shared_ptr<tracker_element_vector_double> e) {
         int64_t avg = 0;
         int64_t avg_c = 0;
 
-        for (TrackerElementVector::iterator i = v.begin(); i != v.end(); ++i)  {
-            int64_t v = GetTrackerValue<int64_t>(*i);
-
-            if (v != default_val()) {
-                avg += GetTrackerValue<int64_t>(*i);
+        for (auto i : *e) {
+            if (i != default_val()) {
+                avg += i;
                 avg_c++;
             }
         }
@@ -106,84 +96,104 @@ public:
 // Base rtl device record
 class rtl433_tracked_common : public tracker_component {
 public:
-    rtl433_tracked_common(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
+    rtl433_tracked_common() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    rtl433_tracked_common(int in_id) :
+        tracker_component(in_id) {
             register_fields();
             reserve_fields(NULL);
         }
 
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new rtl433_tracked_common(globalreg, get_id()));
-    }
-
-    rtl433_tracked_common(GlobalRegistry *in_globalreg, int in_id, 
-            SharedTrackerElement e) :
-        tracker_component(in_globalreg, in_id) {
+    rtl433_tracked_common(int in_id, 
+            std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
         register_fields();
         reserve_fields(e);
     }
 
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("rtl433_tracked_common");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
+    }
+
     __Proxy(model, std::string, std::string, std::string, model);
-    __Proxy(rtlid, uint64_t, uint64_t, uint64_t, rtlid);
+    __Proxy(rtlid, std::string, std::string, std::string, rtlid);
     __Proxy(rtlchannel, std::string, std::string, std::string, rtlchannel);
     __Proxy(battery, std::string, std::string, std::string, battery);
 
 protected:
-    virtual void register_fields() {
+    virtual void register_fields() override {
         tracker_component::register_fields();
 
-        model_id =
-            RegisterField("rtl433.device.model", TrackerString,
-                    "Sensor model", &model);
-
-        rtlid_id =
-            RegisterField("rtl433.device.id", TrackerUInt64,
-                    "Sensor ID", &rtlid);
-
-        rtlchannel_id =
-            RegisterField("rtl433.device.rtlchannel", TrackerString,
-                    "Sensor sub-channel", &rtlchannel);
-
-        battery_id =
-            RegisterField("rtl433.device.battery", TrackerString,
-                    "Sensor battery level", &battery);
+        register_field("rtl433.device.model", "Sensor model", &model);
+        register_field("rtl433.device.id", "Sensor ID", &rtlid);
+        register_field("rtl433.device.rtlchannel", "Sensor sub-channel", &rtlchannel);
+        register_field("rtl433.device.battery", "Sensor battery level", &battery);
     }
 
-    int model_id;
-    SharedTrackerElement model;
+    std::shared_ptr<tracker_element_string> model;
 
     // Device id, could be from the "id" or the "device" record
-    int rtlid_id;
-    SharedTrackerElement rtlid;
+    std::shared_ptr<tracker_element_string> rtlid;
 
     // RTL subchannel, if one is available (many thermometers report one)
-    int rtlchannel_id;
-    SharedTrackerElement rtlchannel;
+    std::shared_ptr<tracker_element_string> rtlchannel;
 
     // Battery as a string
-    int battery_id;
-    SharedTrackerElement battery;
+    std::shared_ptr<tracker_element_string> battery;
 };
 
 // Thermometer type rtl data, derived from the rtl device.  This adds new
 // fields for thermometers but uses the same base IDs
 class rtl433_tracked_thermometer : public tracker_component {
 public:
-    rtl433_tracked_thermometer(GlobalRegistry *in_globalreg, int in_id) :
-       tracker_component(in_globalreg, in_id) {
+    rtl433_tracked_thermometer() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    rtl433_tracked_thermometer(int in_id) :
+       tracker_component(in_id) {
             register_fields();
             reserve_fields(NULL);
         }
 
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new rtl433_tracked_thermometer(globalreg, get_id()));
-    }
-
-    rtl433_tracked_thermometer(GlobalRegistry *in_globalreg, int in_id, 
-            SharedTrackerElement e) :
-        tracker_component(in_globalreg, in_id) {
+    rtl433_tracked_thermometer(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
         register_fields();
         reserve_fields(e);
+    }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("rtl433_tracked_thermometer");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
     }
 
     __Proxy(temperature, double, double, double, temperature);
@@ -194,226 +204,348 @@ public:
     __ProxyTrackable(humidity_rrd, rrdt, humidity_rrd);
 
 protected:
-    virtual void register_fields() {
-        temperature_id =
-            RegisterField("rtl433.device.temperature", TrackerDouble,
-                    "Temperature in degrees Celsius", &temperature);
-
-        std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > rrd_builder(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, 0));
-        temperature_rrd_id =
-            RegisterComplexField("rtl433.device.temperature_rrd", rrd_builder,
-                    "Temperature RRD");
-
-        humidity_id =
-            RegisterField("rtl433.device.humidity", TrackerInt32,
-                    "Humidity", &humidity);
-
-        rrd_builder.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, 0));
-        humidity_rrd_id =
-            RegisterComplexField("rtl433.device.humidity_rrd", rrd_builder,
-                    "Humidity RRD");
-    }
-
-    virtual void reserve_fields(SharedTrackerElement e) {
-        tracker_component::reserve_fields(e);
-
-        if (e != NULL) {
-            temperature_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, temperature_rrd_id, e->get_map_value(temperature_rrd_id)));
-            add_map(temperature_rrd);
-
-            humidity_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, humidity_rrd_id, e->get_map_value(humidity_rrd_id)));
-            add_map(humidity_rrd);
-        } else {
-            temperature_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, temperature_rrd_id));
-            add_map(temperature_rrd);
-
-            humidity_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, humidity_rrd_id));
-            add_map(humidity_rrd);
-        }
+    virtual void register_fields() override {
+        register_field("rtl433.device.temperature", "Temperature in degrees Celsius", &temperature);
+        register_field("rtl433.device.temperature_rrd", "Temperature history RRD", &temperature_rrd);
+        register_field("rtl433.device.humidity", "Humidity", &humidity);
+        register_field("rtl433.device.humidity_rrd", "Humidity history RRD", &humidity_rrd);
     }
 
     // Basic temp in C, from multiple sensors; we might have to convert to C
     // for some types of sensors
-    int temperature_id;
-    SharedTrackerElement temperature;
-
-    int temperature_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > temperature_rrd;
+    std::shared_ptr<tracker_element_double> temperature;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> temperature_rrd;
 
     // Basic humidity in percentage, from multiple sensors
-    int humidity_id;
-    SharedTrackerElement humidity;
-
-    int humidity_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > humidity_rrd;
+    std::shared_ptr<tracker_element_int32> humidity;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> humidity_rrd;
 };
 
 // Weather station type data
 class rtl433_tracked_weatherstation : public tracker_component {
 public:
-    rtl433_tracked_weatherstation(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
+    rtl433_tracked_weatherstation() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    rtl433_tracked_weatherstation(int in_id) :
+        tracker_component(in_id) {
             register_fields();
             reserve_fields(NULL);
         }
 
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new rtl433_tracked_weatherstation(globalreg, get_id()));
-    }
-
-    rtl433_tracked_weatherstation(GlobalRegistry *in_globalreg, int in_id, 
-            SharedTrackerElement e) :
-        tracker_component(in_globalreg, in_id) {
+    rtl433_tracked_weatherstation(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
         register_fields();
         reserve_fields(e);
+    }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("rtl433_tracked_weatherstation");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
     }
 
     __Proxy(wind_dir, int32_t, int32_t, int32_t, wind_dir);
     __Proxy(wind_speed, int32_t, int32_t, int32_t, wind_speed);
     __Proxy(wind_gust, int32_t, int32_t, int32_t, wind_gust);
     __Proxy(rain, int32_t, int32_t, int32_t, rain);
+    __Proxy(uv_index, int32_t, int32_t, int32_t, uv_index);
+    __Proxy(lux, int32_t, int32_t, int32_t, lux);
 
     typedef kis_tracked_rrd<rtl433_empty_aggregator> rrdt;
     __ProxyTrackable(wind_dir_rrd, rrdt, wind_dir_rrd);
     __ProxyTrackable(wind_speed_rrd, rrdt, wind_speed_rrd);
     __ProxyTrackable(wind_gust_rrd, rrdt, wind_gust_rrd);
     __ProxyTrackable(rain_rrd, rrdt, rain_rrd);
+    __ProxyTrackable(uv_index_rrd, rrdt, uv_index_rrd);
+    __ProxyTrackable(lux_rrd, rrdt, lux_rrd);
 
 protected:
-    virtual void register_fields() {
-        wind_dir_id =
-            RegisterField("rtl433.device.wind_dir", TrackerInt32,
-                    "Wind direction in degrees", &wind_dir);
+    virtual void register_fields() override {
+        register_field("rtl433.device.wind_dir", "Wind direction in degrees", &wind_dir);
+        register_field("rtl433.device.wind_dir_rrd", "Wind direction RRD", &wind_dir_rrd);
 
-        std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > rrd_builder(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, 0));
-        wind_dir_rrd_id =
-            RegisterComplexField("rtl433.device.wind_dir_rrd", rrd_builder,
-                    "Wind direction RRD");
+        register_field("rtl433.device.weatherstation.wind_speed", "Wind speed in Kph", &wind_speed);
+        register_field("rtl433.device.wind_speed_rrd", "Wind speed RRD", &wind_speed_rrd);
 
-        wind_speed_id =
-            RegisterField("rtl433.device.wind_speed", TrackerInt32,
-                    "Wind speed in Kph", &wind_speed);
+        register_field("rtl433.device.wind_gust", "Wind gust in Kph", &wind_gust);
+        register_field("rtl433.device.wind_gust_rrd", "Wind gust RRD", &wind_gust_rrd);
 
-        rrd_builder.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, 0));
-        wind_speed_rrd_id =
-            RegisterComplexField("rtl433.device.wind_speed_rrd", rrd_builder,
-                    "Wind speed RRD");
+        register_field("rtl433.device.rain", "Measured rain", &rain);
+        register_field("rtl433.device.rain_rrd", "Rain RRD", &rain_rrd);
 
-        wind_gust_id =
-            RegisterField("rtl433.device.wind_gust", TrackerInt32,
-                    "Wind gust in Kph", &wind_gust);
+        register_field("rtl433.device.uv_index", "UV index", &uv_index);
+        register_field("rtl433.device.uv_index_rrd", "UV Index RRD", &uv_index_rrd);
 
-        rrd_builder.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, 0));
-        wind_gust_rrd_id =
-            RegisterComplexField("rtl433.device.wind_gust_rrd", rrd_builder,
-                    "Wind gust RRD");
-
-        rain_id =
-            RegisterField("rtl433.device.rain", TrackerInt32,
-                    "Measured rain", &rain);
-
-        rrd_builder.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, 0));
-        rain_rrd_id =
-            RegisterComplexField("rtl433.device.rain_rrd", rrd_builder,
-                    "Rain RRD");
-
-    }
-
-    virtual void reserve_fields(SharedTrackerElement e) {
-        tracker_component::reserve_fields(e);
-
-        if (e != NULL) {
-            wind_dir_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, wind_dir_rrd_id, e->get_map_value(wind_dir_rrd_id)));
-            add_map(wind_dir_rrd);
-
-            wind_speed_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, wind_speed_rrd_id, e->get_map_value(wind_speed_rrd_id)));
-            add_map(wind_speed_rrd);
-
-            wind_gust_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, wind_gust_rrd_id, e->get_map_value(wind_gust_rrd_id)));
-            add_map(wind_gust_rrd);
-
-            rain_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, rain_rrd_id, e->get_map_value(rain_rrd_id)));
-            add_map(rain_rrd);
-        } else {
-            wind_dir_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, wind_dir_rrd_id));
-            add_map(wind_dir_rrd);
-
-            wind_speed_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, wind_speed_rrd_id));
-            add_map(wind_speed_rrd);
-
-            wind_gust_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, wind_gust_rrd_id));
-            add_map(wind_gust_rrd);
-
-            rain_rrd.reset(new kis_tracked_rrd<rtl433_empty_aggregator>(globalreg, rain_rrd_id));
-            add_map(rain_rrd);
-        }
+        register_field("rtl433.device.lux", "Lux", &lux);
+        register_field("rtl433.device.lux_rrd", "Lux RRD", &lux_rrd);
     }
 
     // Wind direction in degrees
-    int wind_dir_id;
-    SharedTrackerElement wind_dir;
-
-    int wind_dir_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > wind_dir_rrd;
+    std::shared_ptr<tracker_element_int32> wind_dir;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> wind_dir_rrd;
 
     // Wind speed in kph (might have to convert for some sensors)
-    int wind_speed_id;
-    SharedTrackerElement wind_speed;
+    std::shared_ptr<tracker_element_int32> wind_speed;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> wind_speed_rrd;
 
-    int wind_speed_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > wind_speed_rrd;
-
-    // Wind gust in kph (might have to convert for some sensors)
-    int wind_gust_id;
-    SharedTrackerElement wind_gust;
-
-    int wind_gust_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > wind_gust_rrd;
+    std::shared_ptr<tracker_element_int32> wind_gust;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> wind_gust_rrd;
 
     // Rain (in whatever the sensor reports it in)
-    int rain_id;
-    SharedTrackerElement rain;
+    std::shared_ptr<tracker_element_int32> rain;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> rain_rrd;
 
-    int rain_rrd_id;
-    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator> > rain_rrd;
+    // UV
+    std::shared_ptr<tracker_element_int32> uv_index;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> uv_index_rrd;
+
+    // Lux
+    std::shared_ptr<tracker_element_int32> lux;
+    std::shared_ptr<kis_tracked_rrd<rtl433_empty_aggregator>> lux_rrd;
 };
 
-class Kis_RTL433_Phy : public Kis_Phy_Handler {
+class rtl433_tracked_lightningsensor : public tracker_component {
+public:
+    rtl433_tracked_lightningsensor() :
+        tracker_component() {
+            register_fields();
+            reserve_fields(nullptr);
+        }
+
+    rtl433_tracked_lightningsensor(int in_id) :
+        tracker_component(in_id) {
+            register_fields();
+            reserve_fields(nullptr);
+        }
+
+    rtl433_tracked_lightningsensor(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
+            register_fields();
+            reserve_fields(e);
+        }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("rtl433_tracked_lightningsensor");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
+    }
+
+    __Proxy(strike_count, uint64_t, uint64_t, uint64_t, strike_count);
+    __Proxy(storm_distance, uint64_t, uint64_t, uint64_t, storm_distance);
+    __Proxy(storm_active, uint8_t, bool, bool, storm_active);
+    __Proxy(lightning_rfi, uint64_t, uint64_t, uint64_t, lightning_rfi);
+
+protected:
+    // {"time" : "2019-02-24 22:12:13", "model" : "Acurite Lightning 6045M", "id" : 15580, "channel" : "B", "temperature_F" : 38.300, "humidity" : 53, "strike_count" : 1, "storm_dist" : 8, "active" : 1, "rfi" : 0, "ussb1" : 0, "battery" : "OK", "exception" : 0, "raw_msg" : "bcdc6f354edb81886e"}
+    
+    virtual void register_fields() override {
+        register_field("rtl433.device.lightning_strike_count", "Strike count", &strike_count);
+        register_field("rtl433.device.lightning_storm_distance", "Storm distance (no unit)", &storm_distance);
+        register_field("rtl433.device.lightning_storm_active", "Storm active", &storm_active);
+        register_field("rtl433.device.lightning_rfi", "Lightning radio frequency interference", &lightning_rfi);
+    }
+
+    std::shared_ptr<tracker_element_uint64> strike_count;
+    std::shared_ptr<tracker_element_uint64> storm_distance;
+    std::shared_ptr<tracker_element_uint8> storm_active;
+    std::shared_ptr<tracker_element_uint64> lightning_rfi;
+};
+
+// TPMS tire pressure sensors
+class rtl433_tracked_tpms : public tracker_component {
+public:
+    rtl433_tracked_tpms() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    rtl433_tracked_tpms(int in_id) :
+       tracker_component(in_id) {
+            register_fields();
+            reserve_fields(NULL);
+        }
+
+    rtl433_tracked_tpms(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
+        register_fields();
+        reserve_fields(e);
+    }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("rtl433_tracked_tpms");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
+    }
+
+    __Proxy(pressure_bar, double, double, double, pressure_bar);
+    __Proxy(pressure_kpa, double, double, double, pressure_kpa);
+    __Proxy(flags, std::string, std::string, std::string, flags);
+    __Proxy(state, std::string, std::string, std::string, state);
+    __Proxy(checksum, std::string, std::string, std::string, checksum);
+    __Proxy(code, std::string, std::string, std::string, code);
+
+protected:
+    virtual void register_fields() override {
+        register_field("rtl433.device.tpms.pressure_bar", "Pressure, in bars", &pressure_bar);
+        register_field("rtl433.device.tpms.pressure_kpa", "Pressure, in kPa", &pressure_kpa);
+        register_field("rtl433.device.tpms.flags", "TPMS flags", &flags);
+        register_field("rtl433.device.tpms.state", "TPMS state", &state);
+        register_field("rtl433.device.tpms.checksum", "TPMS checksum", &checksum);
+        register_field("rtl433.device.tpms.code", "TPMS code", &code);
+    }
+
+    std::shared_ptr<tracker_element_double> pressure_bar;
+    std::shared_ptr<tracker_element_double> pressure_kpa;
+    std::shared_ptr<tracker_element_string> flags;
+    std::shared_ptr<tracker_element_string> state;
+    std::shared_ptr<tracker_element_string> checksum;
+    std::shared_ptr<tracker_element_string> code;
+};
+
+// Switch panels
+class rtl433_tracked_switch : public tracker_component {
+public:
+    rtl433_tracked_switch() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    rtl433_tracked_switch(int in_id) :
+       tracker_component(in_id) {
+            register_fields();
+            reserve_fields(NULL);
+        }
+
+    rtl433_tracked_switch(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
+        register_fields();
+        reserve_fields(e);
+    }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("rtl433_tracked_switch");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
+    }
+
+    __ProxyTrackable(switch_vec, tracker_element_vector, switch_vec);
+
+    shared_tracker_element make_switch_entry(int x) {
+        auto e = std::make_shared<tracker_element_int32>(switch_vec_entry_id, x);
+        return e;
+    }
+
+protected:
+    virtual void register_fields() override {
+        register_field("rtl433.device.switch_vec", "Switch settings", &switch_vec);
+        switch_vec_entry_id = 
+            register_field("rtl433.device.switch.position", 
+                    tracker_element_factory<tracker_element_int32>(),
+                    "Switch position");
+    }
+
+    std::shared_ptr<tracker_element_vector> switch_vec;
+    int switch_vec_entry_id;
+
+};
+
+class Kis_RTL433_Phy : public kis_phy_handler {
 public:
     virtual ~Kis_RTL433_Phy();
 
-    Kis_RTL433_Phy(GlobalRegistry *in_globalreg) :
-        Kis_Phy_Handler(in_globalreg) { };
+    Kis_RTL433_Phy(global_registry *in_globalreg) :
+        kis_phy_handler(in_globalreg) { };
 
 	// Build a strong version of ourselves
-	virtual Kis_Phy_Handler *CreatePhyHandler(GlobalRegistry *in_globalreg,
-											  Devicetracker *in_tracker,
-											  int in_phyid) {
-		return new Kis_RTL433_Phy(in_globalreg, in_tracker, in_phyid);
+	virtual kis_phy_handler *create_phy_handler(global_registry *in_globalreg, int in_phyid) override {
+		return new Kis_RTL433_Phy(in_globalreg, in_phyid);
 	}
 
-    Kis_RTL433_Phy(GlobalRegistry *in_globalreg, Devicetracker *in_tracker,
-            int in_phyid);
+    Kis_RTL433_Phy(global_registry *in_globalreg, int in_phyid);
 
     static int PacketHandler(CHAINCALL_PARMS);
 
 protected:
-    std::shared_ptr<Packetchain> packetchain;
-    std::shared_ptr<EntryTracker> entrytracker;
-
-    int rtl433_holder_id, rtl433_common_id, rtl433_thermometer_id, 
-        rtl433_weatherstation_id;
-
-    int pack_comp_common, pack_comp_rtl433;
-
     // Convert a JSON record to a RTL-based device key
     mac_addr json_to_mac(Json::Value in_json);
 
     // convert to a device record & push into device tracker, return false
     // if we can't do anything with it
-    bool json_to_rtl(Json::Value in_json);
+    bool json_to_rtl(Json::Value in_json, kis_packet *packet);
+
+    bool is_weather_station(Json::Value json);
+    bool is_thermometer(Json::Value json);
+    bool is_tpms(Json::Value json);
+    bool is_switch(Json::Value json);
+    bool is_lightning(Json::Value json);
+
+    void add_weather_station(Json::Value json, std::shared_ptr<tracker_element_map> rtlholder);
+    void add_thermometer(Json::Value json, std::shared_ptr<tracker_element_map> rtlholder);
+    void add_tpms(Json::Value json, std::shared_ptr<tracker_element_map> rtlholder);
+    void add_switch(Json::Value json, std::shared_ptr<tracker_element_map> rtlholder);
+    void add_lightning(Json::Value json, std::shared_ptr<tracker_element_map> rtlholder);
 
     double f_to_c(double f);
+
+
+protected:
+    std::shared_ptr<packet_chain> packetchain;
+    std::shared_ptr<entry_tracker> entrytracker;
+    std::shared_ptr<device_tracker> devicetracker;
+
+    int rtl433_holder_id, rtl433_common_id, rtl433_thermometer_id, 
+        rtl433_weatherstation_id, rtl433_tpms_id, rtl433_switch_id,
+        rtl433_lightning_id;
+
+    int pack_comp_common, pack_comp_json, pack_comp_meta;
+
+    std::shared_ptr<tracker_element_string> rtl_manuf;
 
 };
 

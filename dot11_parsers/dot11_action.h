@@ -32,6 +32,7 @@
 #include <memory>
 #include <vector>
 #include <kaitai/kaitaistream.h>
+#include "multi_constexpr.h"
 
 class dot11_action {
 public:
@@ -70,23 +71,23 @@ public:
 
     void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-    category_code_type_e category_code() {
+    constexpr17 category_code_type_e category_code() const {
         return (category_code_type_e) m_category_code;
     }
 
-    std::string action_rmm_data() {
+    std::string action_rmm_data() const {
         return m_action_data;
     }
 
-    std::shared_ptr<kaitai::kstream> action_rmm_data_stream() {
+    std::shared_ptr<kaitai::kstream> action_rmm_data_stream() const {
         return m_action_data_stream;
     }
 
-    std::shared_ptr<action_frame_common> action_frame() {
+    std::shared_ptr<action_frame_common> action_frame() const {
         return m_action_frame;
     }
 
-    std::shared_ptr<action_rmm> action_frame_rmm() {
+    std::shared_ptr<action_rmm> action_frame_rmm() const {
         if (category_code() == category_code_radio_measurement) 
             return std::static_pointer_cast<action_rmm>(action_frame());
         return NULL;
@@ -121,19 +122,19 @@ public:
 
         void parse(std::shared_ptr<kaitai::kstream> p_io);
 
-        rmm_action_type_e rmm_action_code() {
+        constexpr17 rmm_action_type_e rmm_action_code() const {
             return (rmm_action_type_e) m_rmm_action_code;
         }
 
-        uint8_t dialog_token() {
+        constexpr17 uint8_t dialog_token() const {
             return m_dialog_token;
         }
 
-        std::string tags_data() {
+        std::string tags_data() const {
             return m_tags_data;
         }
 
-        std::shared_ptr<kaitai::kstream> tags_data_stream() {
+        std::shared_ptr<kaitai::kstream> tags_data_stream() const {
             return m_tags_data_stream;
         }
 

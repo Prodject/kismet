@@ -60,63 +60,79 @@ public:
 
 class bluetooth_tracked_device : public tracker_component {
 public:
-    bluetooth_tracked_device(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
+    bluetooth_tracked_device() :
+        tracker_component() {
         register_fields();
         reserve_fields(NULL);
     }
 
-    bluetooth_tracked_device(GlobalRegistry *in_globalreg, int in_id, 
-            SharedTrackerElement e) : 
-        tracker_component(in_globalreg, in_id) {
+    bluetooth_tracked_device(int in_id) :
+        tracker_component(in_id) {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    bluetooth_tracked_device(int in_id, 
+            std::shared_ptr<tracker_element_map> e) : 
+        tracker_component(in_id) {
 
         register_fields();
         reserve_fields(e);
     }
 
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new bluetooth_tracked_device(globalreg, get_id()));
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("bluetooth_tracked_device");
     }
 
-    __ProxyTrackable(service_uuid_vec, TrackerElement, service_uuid_vec);
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
+    }
+
+    __ProxyTrackable(service_uuid_vec, tracker_element_vector, service_uuid_vec);
     __Proxy(txpower, int16_t, int16_t, int16_t, txpower);
 
 protected:
-    virtual void register_fields() {
-        RegisterField("bluetooth.device.service_uuid_vec", TrackerVector,
+    virtual void register_fields() override {
+        register_field("bluetooth.device.service_uuid_vec",
                 "advertised service UUIDs", &service_uuid_vec);
-        RegisterField("bluetooth.device.txpower", TrackerInt16,
+        register_field("bluetooth.device.txpower", 
                 "advertised transmit power", &txpower);
     }
 
-    virtual void reserve_fields(SharedTrackerElement e) {
+    virtual void reserve_fields(std::shared_ptr<tracker_element_map> e) override {
         tracker_component::reserve_fields(e);
 
     }
 
-    SharedTrackerElement service_uuid_vec;
-    SharedTrackerElement txpower;
+    std::shared_ptr<tracker_element_vector> service_uuid_vec;
+    std::shared_ptr<tracker_element_int16> txpower;
 };
 
-class Kis_Bluetooth_Phy : public Kis_Phy_Handler {
+class Kis_Bluetooth_Phy : public kis_phy_handler {
 public:
 	// Stub
-	~Kis_Bluetooth_Phy();
+	virtual ~Kis_Bluetooth_Phy();
 
 	// Inherited functionality
-	Kis_Bluetooth_Phy(GlobalRegistry *in_globalreg) :
-		Kis_Phy_Handler(in_globalreg) { };
+	Kis_Bluetooth_Phy(global_registry *in_globalreg) :
+		kis_phy_handler(in_globalreg) { };
 
 	// Build a strong version of ourselves
-	virtual Kis_Phy_Handler *CreatePhyHandler(GlobalRegistry *in_globalreg,
-											  Devicetracker *in_tracker,
+	virtual kis_phy_handler *create_phy_handler(global_registry *in_globalreg,
 											  int in_phyid) {
-		return new Kis_Bluetooth_Phy(in_globalreg, in_tracker, in_phyid);
+		return new Kis_Bluetooth_Phy(in_globalreg, in_phyid);
 	}
 
 	// Strong constructor
-	Kis_Bluetooth_Phy(GlobalRegistry *in_globalreg, Devicetracker *in_tracker,
-            int in_phyid);
+	Kis_Bluetooth_Phy(global_registry *in_globalreg, int in_phyid);
 
 	// Bluetooth device record classifier to common for the devicetracker layer
 	static int CommonClassifierBluetooth(CHAINCALL_PARMS);
@@ -125,14 +141,14 @@ public:
 	static int PacketTrackerBluetooth(CHAINCALL_PARMS);
 
     // Load stored data
-    virtual void LoadPhyStorage(SharedTrackerElement in_storage, 
-            SharedTrackerElement in_device);
+    virtual void load_phy_storage(shared_tracker_element in_storage, 
+            shared_tracker_element in_device);
 
 protected:
-    std::shared_ptr<Alertracker> alertracker;
-    std::shared_ptr<Packetchain> packetchain;
-    std::shared_ptr<EntryTracker> entrytracker;
-    std::shared_ptr<Devicetracker> devicetracker;
+    std::shared_ptr<alert_tracker> alertracker;
+    std::shared_ptr<packet_chain> packetchain;
+    std::shared_ptr<entry_tracker> entrytracker;
+    std::shared_ptr<device_tracker> devicetracker;
 
     int bluetooth_device_entry_id;
 
@@ -140,7 +156,7 @@ protected:
 	int dev_comp_bluetooth, dev_comp_common;
 
 	// Packet components
-	int pack_comp_btdevice, pack_comp_common, pack_comp_l1info;
+	int pack_comp_btdevice, pack_comp_common, pack_comp_l1info, pack_comp_meta;
 };
 
 #endif

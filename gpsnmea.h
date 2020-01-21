@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -31,26 +31,22 @@
 
 // Generic NMEA parser for GPS
 
-class GPSNMEA : public KisGps, public BufferInterface {
+class kis_gps_nmea : public kis_gps {
 public:
-    GPSNMEA(GlobalRegistry *in_globalreg, SharedGpsBuilder in_builder) :
-        KisGps(in_globalreg, in_builder) { 
-        nmeahandler = NULL;
-    }
+    kis_gps_nmea(shared_gps_builder in_builder) :
+        kis_gps(in_builder),
+        nmeahandler {nullptr},
+        nmeainterface {nullptr, nullptr} { }
 
-    virtual ~GPSNMEA() {
-        if (nmeahandler != NULL)
-            delete nmeahandler;
-
-        nmeaclient.reset();
-    };
-
-    // BufferInterface API
-    virtual void BufferAvailable(size_t in_amt);
+    virtual ~kis_gps_nmea() { };
 
 protected:
-    std::shared_ptr<Pollable> nmeaclient;
-    BufferHandler<RingbufV2> *nmeahandler;
+    std::shared_ptr<buffer_handler<ringbuf_v2>> nmeahandler;
+    buffer_interface_func nmeainterface;
+
+    // buffer_interface API
+    virtual void buffer_available(size_t in_amt);
+    virtual void buffer_error(std::string in_err) = 0;
 
     // Have we ever seen data from the device?
     bool ever_seen_gps;

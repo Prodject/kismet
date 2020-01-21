@@ -43,19 +43,24 @@
 #define GLOB_TILDE 0
 #endif
 
-ConfigFile::ConfigFile(GlobalRegistry *in_globalreg) {
-    globalreg = in_globalreg;
+config_file::config_file() {
+    config_locker.set_name("configfile_locker");
     checksum = 0;
 }
 
-ConfigFile::~ConfigFile() {
-    local_eol_locker lock(&config_locker);
+config_file::config_file(global_registry *in_globalreg) {
+    config_locker.set_name("configfile_locker");
+    checksum = 0;
 }
 
-int ConfigFile::ParseConfig(const char *in_fname) {
+config_file::~config_file() {
+    local_locker lock(&config_locker);
+}
+
+int config_file::parse_config(const char *in_fname) {
     int r;
 
-    r = ParseConfig(in_fname, config_map, config_map_dirty);
+    r = parse_config(in_fname, config_map, config_map_dirty);
 
     if (r < 0)
         return r;
@@ -67,7 +72,7 @@ int ConfigFile::ParseConfig(const char *in_fname) {
     }
 
     for (auto f : config_override_file_list) {
-        r = ParseOptOverride(f);
+        r = parse_opt_override(f);
 
         if (r < 0)
             break;
@@ -79,7 +84,7 @@ int ConfigFile::ParseConfig(const char *in_fname) {
     return r;
 }
 
-int ConfigFile::ParseConfig(const char *in_fname,
+int config_file::parse_config(const char *in_fname,
         std::map<std::string, std::vector<config_entity> > &target_map,
         std::map<std::string, int> &target_map_dirty) {
     local_locker lock(&config_locker);
@@ -107,7 +112,7 @@ int ConfigFile::ParseConfig(const char *in_fname,
         lineno++;
 
         // It's easier to parse this using C++ functions
-        std::string parsestr = StrStrip(confline);
+        std::string parsestr = str_strip(confline);
         std::string directive, value;
 
         if (parsestr.length() == 0)
@@ -121,8 +126,8 @@ int ConfigFile::ParseConfig(const char *in_fname,
             directive = parsestr;
             value = "";
         } else {
-            directive = StrStrip(parsestr.substr(0, eq));
-            value = StrStrip(parsestr.substr(eq+1, parsestr.length()));
+            directive = str_strip(parsestr.substr(0, eq));
+            value = str_strip(parsestr.substr(eq+1, parsestr.length()));
 
             if (value == "") {
                 sstream << "Illegal config option in '" << in_fname << "' line " <<
@@ -133,27 +138,27 @@ int ConfigFile::ParseConfig(const char *in_fname,
             }
 
             if (directive == "include") {
-                value = ExpandLogPath(value, "", "", 0, 1);
+                value = expand_log_path(value, "", "", 0, 1);
 
                 sstream << "Including sub-config file: " << value;
                 _MSG(sstream.str(), MSGFLAG_INFO);
                 sstream.str("");
 
-                if (ParseConfig(value.c_str(), target_map, target_map_dirty) < 0) {
+                if (parse_config(value.c_str(), target_map, target_map_dirty) < 0) {
                     fclose(configf);
                     return -1;
                 }
             } else if (directive == "opt_include") {
-                if (ParseOptInclude(ExpandLogPath(value, "", "", 0, 1), target_map, 
+                if (parse_opt_include(expand_log_path(value, "", "", 0, 1), target_map, 
                             target_map_dirty) < 0)
                     return -1;
             } else if (directive == "opt_override") {
                 // Store the override for parsing at the end
-                config_override_file_list.push_back(ExpandLogPath(value, "", "", 0, 1));
+                config_override_file_list.push_back(expand_log_path(value, "", "", 0, 1));
             } else {
                 config_entity e(value, in_fname);
-                target_map[StrLower(directive)].push_back(e);
-                target_map_dirty[StrLower(directive)] = 1;
+                target_map[str_lower(directive)].push_back(e);
+                target_map_dirty[str_lower(directive)] = 1;
             }
         }
     }
@@ -163,7 +168,7 @@ int ConfigFile::ParseConfig(const char *in_fname,
     return 1;
 }
 
-int ConfigFile::ParseOptInclude(const std::string path,
+int config_file::parse_opt_include(const std::string path,
         std::map<std::string, std::vector<config_entity> > &target_map,
         std::map<std::string, int> &target_map_dirty) {
     glob_t globbed;
@@ -186,7 +191,7 @@ int ConfigFile::ParseOptInclude(const std::string path,
             _MSG(sstream.str(), MSGFLAG_INFO);
             sstream.str("");
 
-            if (ParseConfig(globbed.gl_pathv[i], target_map, target_map_dirty) < 0) {
+            if (parse_config(globbed.gl_pathv[i], target_map, target_map_dirty) < 0) {
                 sstream << "Parsing failed for optional sub-config file: " << 
                     globbed.gl_pathv[i];
                 _MSG(sstream.str(), MSGFLAG_ERROR);
@@ -206,7 +211,7 @@ int ConfigFile::ParseOptInclude(const std::string path,
     return 1;
 }
 
-int ConfigFile::ParseOptOverride(const std::string path) {
+int config_file::parse_opt_override(const std::string path) {
     std::map<std::string, std::vector<config_entity> > override_config_map;
     std::map<std::string, int> override_config_map_dirty;
     int r;
@@ -214,7 +219,7 @@ int ConfigFile::ParseOptOverride(const std::string path) {
     _MSG("Loading config override file '" + path + "'", MSGFLAG_INFO);
 
     // Parse into our submaps
-    r = ParseOptInclude(path, override_config_map, override_config_map_dirty);
+    r = parse_opt_include(path, override_config_map, override_config_map_dirty);
 
     // If we hit a legit error or a missing file, bail
     if (r <= 0)
@@ -231,7 +236,7 @@ int ConfigFile::ParseOptOverride(const std::string path) {
 }
 
 
-int ConfigFile::SaveConfig(const char *in_fname) {
+int config_file::save_config(const char *in_fname) {
     local_locker lock(&config_locker);
 
     std::stringstream sstream;
@@ -256,10 +261,10 @@ int ConfigFile::SaveConfig(const char *in_fname) {
     return 1;
 }
 
-std::string ConfigFile::FetchOpt(std::string in_key) {
+std::string config_file::fetch_opt(std::string in_key) {
     local_locker lock(&config_locker);
 
-    auto cmitr = config_map.find(StrLower(in_key));
+    auto cmitr = config_map.find(str_lower(in_key));
     // No such key
     if (cmitr == config_map.end())
         return "";
@@ -273,8 +278,8 @@ std::string ConfigFile::FetchOpt(std::string in_key) {
     return val;
 }
 
-std::string ConfigFile::FetchOptDfl(std::string in_key, std::string in_dfl) {
-    std::string r = FetchOpt(in_key);
+std::string config_file::fetch_opt_dfl(std::string in_key, std::string in_dfl) {
+    std::string r = fetch_opt(in_key);
 
     if (r.length() == 0)
         return in_dfl;
@@ -282,13 +287,13 @@ std::string ConfigFile::FetchOptDfl(std::string in_key, std::string in_dfl) {
     return r;
 }
 
-std::vector<std::string> ConfigFile::FetchOptVec(std::string in_key) {
+std::vector<std::string> config_file::fetch_opt_vec(std::string in_key) {
     local_locker lock(&config_locker);
 
     // Empty vec to return
     std::vector<std::string> eretvec;
 
-    auto cmitr = config_map.find(StrLower(in_key));
+    auto cmitr = config_map.find(str_lower(in_key));
     // No such key
     if (cmitr == config_map.end())
         return eretvec;
@@ -300,14 +305,14 @@ std::vector<std::string> ConfigFile::FetchOptVec(std::string in_key) {
     return eretvec;
 }
 
-int ConfigFile::FetchOptBoolean(std::string in_key, int dvalue) {
+int config_file::fetch_opt_bool(std::string in_key, int dvalue) {
     // Don't lock, we're locked in fetchopt
     // local_locker lock(&config_locker);
 
-    std::string v = StrLower(FetchOpt(in_key));
+    std::string v = str_lower(fetch_opt(in_key));
     int r;
 
-    r = StringToBool(v);
+    r = string_to_bool(v);
 
     if (r == -1)
         return dvalue;
@@ -315,76 +320,43 @@ int ConfigFile::FetchOptBoolean(std::string in_key, int dvalue) {
     return r;
 }
 
-int ConfigFile::FetchOptInt(std::string in_key, int dvalue) {
-    // Don't lock, we're locked in fetchopt
-    // local_locker lock(&config_locker);
-
-    std::string v = StrLower(FetchOpt(in_key));
-    int r;
-
-    try {
-        r = StringToInt(v);
-    } catch (const std::runtime_error e) {
-        return dvalue;
-    }
-
-    return r;
+int config_file::fetch_opt_int(const std::string& in_key, int dvalue) {
+    return fetch_opt_as<int>(in_key, dvalue);
 }
 
-unsigned int ConfigFile::FetchOptUInt(std::string in_key, unsigned int dvalue) {
-    // Don't lock, we're locked in fetchopt
-    // local_locker lock(&config_locker);
-
-    std::string v = FetchOpt(in_key);
-    unsigned int r;
-
-    try {
-        r = StringToUInt(v);
-    } catch (const std::runtime_error e) {
-        return dvalue;
-    }
-
-    return r;
+unsigned int config_file::fetch_opt_uint(const std::string& in_key, unsigned int dvalue) {
+    return fetch_opt_as<unsigned int>(in_key, dvalue);
 }
 
-unsigned long ConfigFile::FetchOptULong(std::string in_key, unsigned long dvalue) {
-    std::string v = FetchOpt(in_key);
-    std::stringstream ss(v);
-    unsigned long r;
-
-    ss >> r;
-
-    if (ss.fail())
-        return dvalue;
-
-    return r;
+unsigned long config_file::fetch_opt_ulong(const std::string& in_key, unsigned long dvalue) {
+    return fetch_opt_as<unsigned long>(in_key, dvalue);
 }
 
-int ConfigFile::FetchOptDirty(std::string in_key) {
+int config_file::fetch_opt_dirty(const std::string& in_key) {
     local_locker lock(&config_locker);
-    if (config_map_dirty.find(StrLower(in_key)) == config_map_dirty.end())
+    if (config_map_dirty.find(str_lower(in_key)) == config_map_dirty.end())
         return 0;
 
-    return config_map_dirty[StrLower(in_key)];
+    return config_map_dirty[str_lower(in_key)];
 }
 
-void ConfigFile::SetOptDirty(std::string in_key, int in_dirty) {
+void config_file::set_opt_dirty(const std::string& in_key, int in_dirty) {
     local_locker lock(&config_locker);
-    config_map_dirty[StrLower(in_key)] = in_dirty;
+    config_map_dirty[str_lower(in_key)] = in_dirty;
 }
 
-void ConfigFile::SetOpt(std::string in_key, std::string in_val, int in_dirty) {
+void config_file::set_opt(const std::string& in_key, const std::string& in_val, int in_dirty) {
     local_locker lock(&config_locker);
 
     std::vector<config_entity> v;
     config_entity e(in_val, "::dynamic::");
     v.push_back(e);
-    config_map[StrLower(in_key)] = v;
-    SetOptDirty(in_key, in_dirty);
+    config_map[str_lower(in_key)] = v;
+    set_opt_dirty(in_key, in_dirty);
 }
 
-void ConfigFile::SetOptVec(std::string in_key, 
-        std::vector<std::string> in_val, int in_dirty) {
+void config_file::set_opt_vec(const std::string& in_key, const std::vector<std::string>& in_val, 
+        int in_dirty) {
     local_locker lock(&config_locker);
 
     std::vector<config_entity> cev;
@@ -393,8 +365,8 @@ void ConfigFile::SetOptVec(std::string in_key,
         cev.push_back(ce);
     }
 
-    config_map[StrLower(in_key)] = cev;
-    SetOptDirty(in_key, in_dirty);
+    config_map[str_lower(in_key)] = cev;
+    set_opt_dirty(in_key, in_dirty);
 }
 
 
@@ -403,8 +375,8 @@ void ConfigFile::SetOptVec(std::string in_key,
 // Logfile name to use
 // Logfile type to use
 // Starting number or desired number
-std::string ConfigFile::ExpandLogPath(std::string path, std::string logname, std::string type,
-        int start, int overwrite) {
+std::string config_file::expand_log_path(const std::string& path, const std::string& logname, 
+        const std::string& type, int start, int overwrite) {
     local_locker lock(&config_locker);
 
     std::string logtemplate;
@@ -423,51 +395,48 @@ std::string ConfigFile::ExpandLogPath(std::string path, std::string logname, std
             logtemplate.insert(nl, logname);
         else if (op == 'd') {
             time_t tnow;
-            struct tm *now;
+            struct tm now;
 
-            // tnow = time(0);
-            tnow = globalreg->start_time;
-            now = localtime(&tnow);
+            tnow = Globalreg::globalreg->start_time;
+            gmtime_r(&tnow, &now);
 
             char datestr[24];
-            strftime(datestr, 24, "%b-%d-%Y", now);
+            strftime(datestr, 24, "%b-%d-%Y", &now);
 
             logtemplate.insert(nl, datestr);
         }
         else if (op == 'D') {
             time_t tnow;
-            struct tm *now;
+            struct tm now;
 
-            // tnow = time(0);
-            tnow = globalreg->start_time;
-            now = localtime(&tnow);
+            tnow = Globalreg::globalreg->start_time;
+            gmtime_r(&tnow, &now);
 
             char datestr[24];
-            strftime(datestr, 24, "%Y%m%d", now);
+            strftime(datestr, 24, "%Y%m%d", &now);
 
             logtemplate.insert(nl, datestr);
         } else if (op == 't') {
             time_t tnow;
-            struct tm *now;
+            struct tm now;
 
-            // tnow = time(0);
-            tnow = globalreg->start_time;
-            now = localtime(&tnow);
+            tnow = Globalreg::globalreg->start_time;
+            gmtime_r(&tnow, &now);
 
             char timestr[12];
-            strftime(timestr, 12, "%H-%M-%S", now);
+            strftime(timestr, 12, "%H-%M-%S", &now);
 
             logtemplate.insert(nl, timestr);
         } else if (op == 'T') {
             time_t tnow;
-            struct tm *now;
+            struct tm now;
 
             // tnow = time(0);
-            tnow = globalreg->start_time;
-            now = localtime(&tnow);
+            tnow = Globalreg::globalreg->start_time;
+            gmtime_r(&tnow, &now);
 
             char timestr[12];
-            strftime(timestr, 12, "%H%M%S", now);
+            strftime(timestr, 12, "%H%M%S", &now);
 
             logtemplate.insert(nl, timestr);
         } else if (op == 'l') {
@@ -478,7 +447,7 @@ std::string ConfigFile::ExpandLogPath(std::string path, std::string logname, std
             inc = nl;
             incpad = 1;
         } else if (op == 'h') { 
-            if (globalreg->homepath == "") {
+            if (Globalreg::globalreg->homepath == "") {
                 char *pwbuf;
                 ssize_t pwbuf_sz;
                 struct passwd pw, *pw_result = NULL;
@@ -500,13 +469,13 @@ std::string ConfigFile::ExpandLogPath(std::string path, std::string logname, std
 
                 delete[] pwbuf;
             } else {
-                logtemplate.insert(nl, globalreg->homepath);
+                logtemplate.insert(nl, Globalreg::globalreg->homepath);
             }
         } else if (op == 'p') {
-            std::string pfx = globalreg->log_prefix;
+            std::string pfx = Globalreg::globalreg->log_prefix;
 
             if (pfx == "") 
-                pfx = FetchOptDfl("log_prefix", "./");
+                pfx = fetch_opt_dfl("log_prefix", "./");
 
             if (pfx != "") 
                 if (pfx[pfx.length() - 1] != '/')
@@ -514,9 +483,9 @@ std::string ConfigFile::ExpandLogPath(std::string path, std::string logname, std
 
             logtemplate.insert(nl, pfx);
         } else if (op == 'S') {
-            logtemplate.insert(nl, DATA_LOC);
+            logtemplate.insert(nl, Globalreg::globalreg->data_dir);
         } else if (op == 'E') {
-            logtemplate.insert(nl, SYSCONF_LOC);
+            logtemplate.insert(nl, Globalreg::globalreg->etc_dir);
         } else if (op == 'B') {
             logtemplate.insert(nl, BIN_LOC);
         }
@@ -629,16 +598,16 @@ std::string ConfigFile::ExpandLogPath(std::string path, std::string logname, std
     return logtemplate;
 }
 
-uint32_t ConfigFile::FetchFileChecksum() {
+uint32_t config_file::fetch_file_checksum() {
     local_locker lock(&config_locker);
 
     if (checksum == 0)
-        CalculateChecksum();
+        calculate_file_checksum();
 
     return checksum;
 }
 
-void ConfigFile::CalculateChecksum() {
+void config_file::calculate_file_checksum() {
     local_locker lock(&config_locker);
 
     std::string cks;
@@ -650,6 +619,119 @@ void ConfigFile::CalculateChecksum() {
         }
     }
 
-    checksum = Adler32Checksum(cks.c_str(), cks.length());
+    checksum = adler32_checksum(cks.c_str(), cks.length());
+}
+
+header_value_config::header_value_config(const std::string& in_confline) {
+    parse_line(in_confline);
+}
+
+header_value_config::header_value_config() {
+}
+
+void header_value_config::parse_line(const std::string& in_confline) {
+    local_locker l(&mutex);
+
+    auto cpos = in_confline.find(":");
+
+    content_map.clear();
+
+    if (cpos == std::string::npos) {
+        header = in_confline;
+    } else {
+        header = in_confline.substr(0, cpos);
+        std::vector<opt_pair> opt_vec;
+        string_to_opts(in_confline.substr(cpos + 1, in_confline.size() - cpos), ",", &opt_vec);
+
+        for (auto oi : opt_vec)
+            content_map[oi.opt] = oi.val;
+    }
+}
+
+std::string header_value_config::get_header() {
+    local_locker l(&mutex);
+    return header;
+}
+
+void header_value_config::set_header(const std::string& in_str) {
+    local_locker l(&mutex);
+    header = in_str;
+}
+
+bool header_value_config::has_key(const std::string& in_str) {
+    local_locker l(&mutex);
+    return (content_map.find(in_str) != content_map.end());
+}
+
+std::string header_value_config::get_value(const std::string& in_str) {
+    local_locker l(&mutex);
+    
+    auto vi = content_map.find(in_str);
+
+    if (vi == content_map.end())
+        throw std::runtime_error(fmt::format("no such key in content map: {}", in_str));
+
+    return vi->second;
+}
+
+std::string header_value_config::get_value(const std::string& in_str, const std::string& in_defl) {
+    local_locker l(&mutex);
+
+    auto vi = content_map.find(in_str);
+
+    if (vi == content_map.end())
+        return in_defl;
+
+    return vi->second;
+}
+
+void header_value_config::erase_key(const std::string& in_key) {
+    local_locker l(&mutex);
+
+    auto vi = content_map.find(in_key);
+
+    if (vi == content_map.end())
+        return;
+
+    content_map.erase(vi);
+}
+
+std::string header_value_config::to_string() {
+    std::stringstream ss;
+
+    ss << header << ":";
+
+    bool add_comma = false;
+    for (auto kv : content_map) {
+        if (add_comma)
+            ss << ",";
+        add_comma = true;
+
+        ss << kv.first << "=\"" << kv.second << "\"";
+    }
+
+    return ss.str();
+}
+
+std::ostream& operator<<(std::ostream& os, const header_value_config& h) {
+    os << h.header << ":";
+
+    bool add_comma = false;
+    for (auto kv : h.content_map) {
+        if (add_comma)
+            os << ",";
+        add_comma = true;
+
+        os << kv.first << "=\"" << kv.second << "\"";
+    }
+
+    return os;
+}
+
+std::istream& operator>>(std::istream& is, header_value_config& h) {
+    std::string sline;
+    std::getline(is, sline);
+    h.parse_line(sline);
+    return is;
 }
 

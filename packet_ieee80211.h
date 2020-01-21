@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -226,12 +226,13 @@ typedef struct {
 #define crypt_aes_ccm		(1 << 9)
 //WPA Migration Mode
 #define crypt_wpa_migmode	(1 << 10)
-// Derived from data traffic
 #define crypt_eap			(1 << 11)
 #define crypt_leap			(1 << 12)
 #define crypt_ttls			(1 << 13)
 #define crypt_tls			(1 << 14)
 #define crypt_peap			(1 << 15)
+#define crypt_sae           (1 << 16)
+#define crypt_wpa_owe       (1 << 17)
 // Lower byte mask - cryptset & protectmask yields basic setting, ie cannot be
 // WEP+PEAP, but COULD be WEP+ISAKMP or WEP+WPS
 #define crypt_protectmask 	0xFFFFF
@@ -244,6 +245,7 @@ typedef struct {
 #define crypt_wps 					(1 << 26)
 #define crypt_version_wpa   (1 << 27)
 #define crypt_version_wpa2  (1 << 28)
+#define crypt_version_wpa3  (1 << 29)
 // L3 encryption mask
 #define crypt_l3_mask		0x300004
 // L2 encryption mask
@@ -267,12 +269,12 @@ typedef struct {
     unsigned short more_fragments : 1;
     unsigned short from_ds : 1;
     unsigned short to_ds : 1;
-} frame_control __attribute__ ((packed));
+} __attribute__ ((packed)) frame_control;
 
 typedef struct {
     unsigned short frag : 12;
     unsigned short sequence : 4;
-} wireless_fragseq __attribute__ ((packed));
+} __attribute__ ((packed)) wireless_fragseq;
 
 typedef struct {
     uint8_t timestamp[8];
@@ -292,7 +294,7 @@ typedef struct {
 
     unsigned int coordinator : 8;
 
-} fixed_parameters __attribute__ ((packed));
+} __attribute__ ((packed)) fixed_parameters;
 
 #else
 // And 802.11 packet frame header

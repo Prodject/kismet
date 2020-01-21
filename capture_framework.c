@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <stdio.h>
+#include <stdbool.h>
 
 #ifdef HAVE_CAPABILITY
 #include <sys/capability.h>
@@ -45,8 +47,43 @@
 #include <sys/mount.h>
 #endif
 
-#include "msgpuck.h"
 #include "capture_framework.h"
+#include "kis_external_packet.h"
+
+#include "protobuf_c/kismet.pb-c.h"
+#include "protobuf_c/datasource.pb-c.h"
+
+uint32_t adler32_partial_csum(uint8_t *in_buf, size_t in_len,
+        uint32_t *s1, uint32_t *s2) {
+	size_t i;
+	uint8_t *buf = in_buf;
+	int CHAR_OFFSET = 0;
+
+    if (in_len < 4)
+        return 0;
+
+    for (i = 0; i < (in_len - 4); i += 4) {
+        *s2 += 4 * (*s1 + buf[i]) + 3 * buf[i + 1] + 2 * buf[i+2] + buf[i + 3] + 
+            10 * CHAR_OFFSET;
+        *s1 += (buf[i + 0] + buf[i + 1] + buf[i + 2] + buf[i + 3] + 4 * CHAR_OFFSET); 
+	}
+
+    for (; i < in_len; i++) {
+        *s1 += (buf[i] + CHAR_OFFSET); 
+        *s2 += *s1;
+	}
+
+	return (*s1 & 0xffff) + (*s2 << 16);
+}
+
+uint32_t adler32_csum(uint8_t *in_buf, size_t in_len) {
+    uint32_t s1, s2;
+
+    s1 = 0;
+    s2 = 0;
+
+    return adler32_partial_csum(in_buf, in_len, &s1, &s2);
+}
 
 int cf_parse_interface(char **ret_interface, char *definition) {
     char *colonpos;
@@ -98,7 +135,6 @@ int cf_find_flag(char **ret_value, const char *flag, char *definition) {
             /* If it's null we're the last flag, so use the total length after
              * the equals as the value */
             if (comma == NULL && quote == NULL) {
-                printf("comma and quote null\n");
                 *ret_value = equals + 1;
                 return strlen(equals) - 1;
             }
@@ -106,14 +142,11 @@ int cf_find_flag(char **ret_value, const char *flag, char *definition) {
             /* If we've got a quote inside the string, before the terminating comma,
              * find the next quote and return that as the length */
             if (quote != NULL) {
-                printf("quote not null\n");
                 if ((comma != NULL && quote < comma) || comma == NULL) {
-                    printf("quote < comma or comma null %p %p\n", quote, comma);
                     equote = strstr(quote + 1, "\"");
                     *ret_value = quote + 1;
                     return (equote - (quote + 1));
                 } else {
-                    printf("quote out of flag\n");
                 }
             }
 
@@ -278,6 +311,7 @@ kis_capture_handler_t *cf_handler_init(const char *in_type) {
         return NULL;
 
     ch->last_ping = time(0);
+    ch->seqno = 1;
 
     ch->capsource_type = strdup(in_type);
 
@@ -286,17 +320,26 @@ kis_capture_handler_t *cf_handler_init(const char *in_type) {
     ch->remote_host = NULL;
     ch->remote_port = 0;
 
+    ch->reverse_server = 0;
+
     ch->cli_sourcedef = NULL;
 
     ch->in_fd = -1;
     ch->out_fd = -1;
     ch->tcp_fd = -1;
+    ch->listen_fd = -1;
 
     /* Disable retry by default */
     ch->remote_retry = 0;
 
     /* Disable daemon mode by default */
     ch->daemonize = 0;
+
+    /* Zero the GPS */
+    ch->gps_fixed_lat = 0;
+    ch->gps_fixed_lon = 0;
+    ch->gps_fixed_alt = 0;
+    ch->gps_name = NULL;
 
     /* Allocate a smaller incoming ringbuffer since most of our traffic is
      * on the outgoing channel */
@@ -347,6 +390,7 @@ kis_capture_handler_t *cf_handler_init(const char *in_type) {
     ch->capture_running = 0;
     ch->hopping_running = 0;
 
+    ch->channel = NULL;
     ch->channel_hop_list = NULL;
     ch->custom_channel_hop_list = NULL;
     ch->channel_hop_list_sz = 0;
@@ -489,7 +533,8 @@ void cf_handler_spindown(kis_capture_handler_t *caph) {
 }
 
 void cf_handler_assign_hop_channels(kis_capture_handler_t *caph, char **stringchans,
-        void **privchans, size_t chan_sz, double rate, int shuffle, int offset) {
+        void **privchans, size_t chan_sz, double rate, int shuffle, int shuffle_spacing, 
+        int offset) {
     size_t szi;
 
     /*
@@ -521,9 +566,14 @@ void cf_handler_assign_hop_channels(kis_capture_handler_t *caph, char **stringch
     caph->channel_hop_list = stringchans;
     caph->custom_channel_hop_list = privchans;
     caph->channel_hop_list_sz = chan_sz;
-    caph->channel_hop_rate = rate;
+
+    if (caph->max_channel_hop_rate != 0 && rate < caph->max_channel_hop_rate)
+        caph->channel_hop_rate = caph->max_channel_hop_rate;
+    else
+        caph->channel_hop_rate = rate;
 
     caph->channel_hop_shuffle = shuffle;
+    caph->channel_hop_shuffle_spacing = shuffle_spacing;
     caph->channel_hop_offset = offset;
 
     if (caph->channel_hop_shuffle && caph->channel_hop_shuffle_spacing && chan_sz != 0) {
@@ -616,16 +666,17 @@ void cf_handler_list_devices(kis_capture_handler_t *caph) {
                 }
                 
                 fprintf(stderr, "\n");
+
+                if (interfaces[i]->interface != NULL)
+                    free(interfaces[i]->interface);
+                if (interfaces[i]->flags != NULL)
+                    free(interfaces[i]->flags);
+                if (interfaces[i]->hardware != NULL)
+                    free(interfaces[i]->hardware);
+
+                free(interfaces[i]);
             }
 
-            if (interfaces[i]->interface != NULL)
-                free(interfaces[i]->interface);
-            if (interfaces[i]->flags != NULL)
-                free(interfaces[i]->flags);
-            if (interfaces[i]->hardware != NULL)
-                free(interfaces[i]->hardware);
-
-            free(interfaces[i]);
         }
 
         free(interfaces);
@@ -639,7 +690,7 @@ int cf_handler_parse_opts(kis_capture_handler_t *caph, int argc, char *argv[]) {
     opterr = 0;
     option_idx = 0;
 
-    char parse_hname[512];
+    char parse_hname[513];
     unsigned int parse_port;
 
     int retry = 1;
@@ -653,9 +704,16 @@ int cf_handler_parse_opts(kis_capture_handler_t *caph, int argc, char *argv[]) {
         { "disable-retry", no_argument, 0, 5 },
         { "daemonize", no_argument, 0, 6},
         { "list", no_argument, 0, 7},
+        { "fixed-gps", required_argument, 0, 8},
+        { "gps-name", required_argument, 0, 9},
+        { "host", required_argument, 0, 10},
         { "help", no_argument, 0, 'h'},
         { 0, 0, 0, 0 }
     };
+
+    char *gps_arg = NULL;
+
+    int pr;
 
     while (1) {
         int r = getopt_long(argc, argv, "h-", longopt, &option_idx);
@@ -695,13 +753,48 @@ int cf_handler_parse_opts(kis_capture_handler_t *caph, int argc, char *argv[]) {
             cf_handler_list_devices(caph);
             cf_handler_free(caph);
             exit(1);
+        } else if (r == 8) {
+            gps_arg = strdup(optarg);
+        } else if (r == 9) {
+            caph->gps_name = strdup(optarg);
+        } else if (r == 10) {
+            if (sscanf(optarg, "%512[^:]:%u", parse_hname, &parse_port) != 2) {
+                fprintf(stderr, "FATAL: Expected ip:port for --host\n");
+                return -1;
+            }
+
+            caph->remote_host = strdup(parse_hname);
+            caph->remote_port = parse_port;
+            caph->reverse_server = 1;
         }
     }
 
     if (caph->remote_host == NULL && caph->cli_sourcedef != NULL) {
         fprintf(stderr, 
-                "WARNING: Ignoring --source option when not connecting to a remote host\n");
+                "WARNING: Ignoring --source option when not in remote mode.\n");
     }
+
+    if (caph->remote_host == NULL && gps_arg != NULL) {
+        fprintf(stderr, 
+                "WARNING: Ignoring --fixed-gps option when not in remote mode.\n");
+    }
+
+    if (gps_arg != NULL) {
+        pr = sscanf(gps_arg, "%lf,%lf,%lf", 
+                &(caph->gps_fixed_lat), &(caph->gps_fixed_lon),
+                &(caph->gps_fixed_alt));
+
+        if (pr == 2) {
+            caph->gps_fixed_alt = 0;
+        } else if (pr < 2) {
+            fprintf(stderr, 
+                    "FATAL:  --fixed-gps expects lat,lon or lat,lon,alt\n");
+            return -1;
+        }
+
+        free(gps_arg);
+    }
+
 
     if (caph->remote_host != NULL) {
         /* Must have a --source to present to the remote host */
@@ -716,6 +809,9 @@ int cf_handler_parse_opts(kis_capture_handler_t *caph, int argc, char *argv[]) {
 
         /* Set daemon mode only when we have a remote host */
         caph->daemonize = daemon;
+
+        if (caph->reverse_server)
+            return 3;
 
         return 2;
     }
@@ -733,15 +829,21 @@ void cf_print_help(kis_capture_handler_t *caph, const char *argv0) {
     
     if (caph->remote_capable) {
         fprintf(stderr, "\n%s supports sending data to a remote Kismet server\n"
-                "Usage: %s [options]\n"
+                "usage: %s [options]\n"
                 " --connect [host]:[port]     Connect to remote Kismet server on [host] \n"
                 "                             and [port]; typically Kismet accepts remote \n"
                 "                             capture on port 3501.\n"
+                " --host [ip]:[port]          Listen for incoming remote connections on \n"
+                "                             [interface] and [port]; You need to use a different \n"
+                "                             port for each source you define.\n"
                 " --source [source def]       Specify a source to send to the remote \n"
                 "                             Kismet server; only used in conjunction with \n"
                 "                             remote capture.\n"
                 " --disable-retry             Do not attempt to reconnect to a remote server\n"
                 "                             if there is an error; exit immediately\n"
+                " --fixed-gps [lat,lon,alt]   Set a fixed location for this capture (remote only),\n"
+                "                             accepts lat,lon,alt or lat,lon\n"
+                " --gps-name [name]           Set an alternate GPS name for this source\n"
                 " --daemonize                 Background the capture tool and enter daemon\n"
                 "                             mode.\n"
                 " --list                      List supported devices detected\n",
@@ -831,8 +933,8 @@ void *cf_int_capture_thread(void *arg) {
         fprintf(stderr, "ERROR - No capture handler defined for capture thread\n");
     }
 
-    cf_send_error(caph, "capture thread ended, source is closed.");
-    
+    cf_send_error(caph, 0, "capture thread ended, source is closed.");
+   
     cf_handler_spindown(caph);
 
     return NULL;
@@ -840,7 +942,7 @@ void *cf_int_capture_thread(void *arg) {
 
 /* Launch a capture thread after opening has been successful */
 int cf_handler_launch_capture_thread(kis_capture_handler_t *caph) {
-    /* Set the thread attributes - detatched, cancelable */
+    /* Set the thread attributes - detached, cancelable */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -854,7 +956,7 @@ int cf_handler_launch_capture_thread(kis_capture_handler_t *caph) {
     if (pthread_create(&(caph->capturethread), &attr, 
                 cf_int_capture_thread, caph) < 0) {
         /* fprintf(stderr, "debug - failed to pthread_create %s\n", strerror(errno)); */
-        cf_send_error(caph, "failed to launch capture thread");
+        cf_send_error(caph, 0, "failed to launch capture thread");
         cf_handler_spindown(caph);
         return -1;
     }
@@ -883,11 +985,8 @@ void *cf_int_chanhop_thread(void *arg) {
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
-    /* Where we are in the hopping vec */
-    pthread_mutex_lock(&(caph->handler_lock));
-    size_t hoppos = caph->channel_hop_offset;
-    pthread_mutex_unlock(&(caph->handler_lock));
-
+    size_t hoppos;
+    
     /* How long we're waiting until the next time */
     unsigned int wait_sec = 0;
     unsigned int wait_usec = 0;
@@ -896,11 +995,19 @@ void *cf_int_chanhop_thread(void *arg) {
     
     int r = 0;
 
+    /* Figure out where we are in the hopping vec, and set us to actively hopping
+     * right now; this will block until the thread launcher brings us up */
+    pthread_mutex_lock(&(caph->handler_lock));
+    hoppos = caph->channel_hop_offset;
+    caph->hopping_running = 1;
+    pthread_mutex_unlock(&(caph->handler_lock));
+
+
     while (1) {
         pthread_mutex_lock(&(caph->handler_lock));
 
         /* Cancel thread if we're no longer hopping */
-        if (caph->channel_hop_rate == 0) {
+        if (caph->channel_hop_rate == 0 || caph->hopping_running == 0) {
             caph->hopping_running = 0;
             pthread_mutex_unlock(&(caph->handler_lock));
             return NULL;
@@ -925,6 +1032,7 @@ void *cf_int_chanhop_thread(void *arg) {
         pthread_mutex_lock(&caph->handler_lock);
 
         if (caph->channel_hop_rate == 0 || caph->chancontrol_cb == NULL) {
+            // fprintf(stderr, "debug - hop rate 0 or no chancontrol\n");
             caph->hopping_running = 0;
             pthread_mutex_unlock(&caph->handler_lock);
             return NULL;
@@ -934,7 +1042,7 @@ void *cf_int_chanhop_thread(void *arg) {
         if ((r = (caph->chancontrol_cb)(caph, 0, 
                     caph->custom_channel_hop_list[hoppos % caph->channel_hop_list_sz], 
                     errstr)) < 0) {
-            cf_send_error(caph, errstr);
+            cf_send_error(caph, 0, errstr);
             caph->hopping_running = 0;
             pthread_mutex_unlock(&caph->handler_lock);
             cf_handler_spindown(caph);
@@ -993,7 +1101,7 @@ void *cf_int_chanhop_thread(void *arg) {
                         "assigned channels (%lu), something is wrong internally.",
                         caph->channel_hop_failure_list_sz,
                         caph->channel_hop_list_sz);
-                cf_send_error(caph, errstr);
+                cf_send_error(caph, 0, errstr);
                 caph->hopping_running = 0;
                 pthread_mutex_unlock(&caph->handler_lock);
                 cf_handler_spindown(caph);
@@ -1050,8 +1158,7 @@ void *cf_int_chanhop_thread(void *arg) {
             snprintf(errstr, STATUS_MAX, "Removed %lu channels from the channel list "
                     "because the source could not tune to them", 
                     caph->channel_hop_failure_list_sz);
-            cf_send_configresp_chanhop(caph, 0, 1, errstr,
-                    caph->channel_hop_rate, caph->channel_hop_list, caph->channel_hop_list_sz);
+            cf_send_configresp(caph, 0, 1, errstr, NULL);
 
 
             // fprintf(stderr, "debug - clearing out old list\n");
@@ -1067,15 +1174,13 @@ void *cf_int_chanhop_thread(void *arg) {
         }
 
         pthread_mutex_unlock(&caph->handler_lock);
-
-
     }
 
     return NULL;
 }
 
 int cf_handler_launch_hopping_thread(kis_capture_handler_t *caph) {
-    /* Set the thread attributes - detatched, cancelable */
+    /* Set the thread attributes - detached, cancelable */
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -1087,7 +1192,7 @@ int cf_handler_launch_hopping_thread(kis_capture_handler_t *caph) {
     }
 
     if (pthread_create(&(caph->hopthread), &attr, cf_int_chanhop_thread, caph) < 0) {
-        cf_send_error(caph, "failed to launch channel hopping thread");
+        cf_send_error(caph, 0, "failed to launch channel hopping thread");
         cf_handler_spindown(caph);
         return -1;
     }
@@ -1102,16 +1207,20 @@ int cf_handler_launch_hopping_thread(kis_capture_handler_t *caph) {
 int cf_handle_rx_data(kis_capture_handler_t *caph) {
     size_t rb_available;
 
-    simple_cap_proto_frame_t *cap_proto_frame;
-
-    /* Buffer of just the packet header */
-    uint8_t hdr_buf[sizeof(simple_cap_proto_t)];
+    kismet_external_frame_t *external_frame;
 
     /* Buffer of entire frame, dynamic */
     uint8_t *frame_buf;
 
     /* Incoming size */
     uint32_t packet_sz;
+    uint32_t total_sz = 0;
+
+    /* Incoming checksum */
+    uint32_t data_checksum;
+
+    /* Calculated checksum */
+    uint32_t calc_checksum;
 
     /* Callback ret */
     int cbret = -1;
@@ -1119,86 +1228,106 @@ int cf_handle_rx_data(kis_capture_handler_t *caph) {
     /* Status buffer */
     char msgstr[STATUS_MAX];
 
+    /* Kismet command */
+    KismetExternal__Command *kds_cmd;
+
     size_t i;
 
     rb_available = kis_simple_ringbuf_used(caph->in_ringbuf);
 
-    if (rb_available < sizeof(simple_cap_proto_t)) {
+    if (rb_available < sizeof(kismet_external_frame_t)) {
         /* fprintf(stderr, "DEBUG - insufficient data to represent a frame\n"); */
         return 0;
     }
 
-    if (kis_simple_ringbuf_peek(caph->in_ringbuf, hdr_buf, 
-                sizeof(simple_cap_proto_t)) != sizeof(simple_cap_proto_t)) {
+    if (kis_simple_ringbuf_peek_zc(caph->in_ringbuf, (void **) &frame_buf, 
+                sizeof(kismet_external_frame_t)) != sizeof(kismet_external_frame_t)) {
         return 0;
     }
 
-    cap_proto_frame = (simple_cap_proto_frame_t *) hdr_buf;
+    external_frame = (kismet_external_frame_t *) frame_buf;
 
     /* Check the signature */
-    if (ntohl(cap_proto_frame->header.signature) != KIS_CAP_SIMPLE_PROTO_SIG) {
+    if (ntohl(external_frame->signature) != KIS_EXTERNAL_PROTO_SIG) {
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
         fprintf(stderr, "FATAL: Invalid frame header received\n");
         return -1;
     }
 
-    /* Check the header checksum */
-    if (!validate_simple_cap_proto_header(&(cap_proto_frame->header))) {
-        fprintf(stderr, "DEBUG: Invalid checksum on frame header\n");
+    /* If the signature passes, see if we can read the whole frame */
+    packet_sz = ntohl(external_frame->data_sz);
+    total_sz = packet_sz + sizeof(kismet_external_frame_t);
+
+    if (total_sz >= kis_simple_ringbuf_size(caph->in_ringbuf)) {
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
+        fprintf(stderr, "FATAL: Incoming packet too large for ringbuf\n");
         return -1;
     }
 
-    /* If the signature passes, see if we can read the whole frame */
-    packet_sz = ntohl(cap_proto_frame->header.packet_sz);
-
-    if (rb_available < packet_sz) {
+    if (rb_available < total_sz) {
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
         return 0;
     }
 
-    /* We've got enough to read it all; allocate the buffer and read it in */
-    frame_buf = (uint8_t *) malloc(packet_sz);
+    /* Free the peek of the frame header */
+    kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
 
-    if (frame_buf == NULL) {
-        fprintf(stderr, "FATAL:  Could not allocate read buffer\n");
-        return -1;
-    }
+    /* We've got enough to read it all; try to zc the buffer */
 
     /* Peek our ring buffer */
-    if (kis_simple_ringbuf_peek(caph->in_ringbuf, frame_buf, packet_sz) != packet_sz) {
+    if (kis_simple_ringbuf_peek_zc(caph->in_ringbuf, (void **) &frame_buf, total_sz) != total_sz) {
         fprintf(stderr, "FATAL: Failed to read packet from ringbuf\n");
         free(frame_buf);
         return -1;
     }
 
-    /* Clear it out from the buffer */
-    kis_simple_ringbuf_read(caph->in_ringbuf, NULL, packet_sz);
+    external_frame = (kismet_external_frame_t *) frame_buf;
 
-    cap_proto_frame = (simple_cap_proto_frame_t *) frame_buf;
+    /* Checksum it */
+    calc_checksum = adler32_csum(external_frame->data, packet_sz);
 
-    /* Validate it */
-    if (!validate_simple_cap_proto(&(cap_proto_frame->header))) {
-        fprintf(stderr, "FATAL:  Invalid control frame\n");
-        free(frame_buf);
+    data_checksum = ntohl(external_frame->data_checksum);
+
+    if (calc_checksum != data_checksum) {
+        // fprintf(stderr, "DEBUG - C - Checksum %x calced %x len %u\n", calc_checksum, data_checksum, packet_sz);
+        fprintf(stderr, "FATAL:  Invalid frame received, checksum does not match\n");
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
+        return -1;
+    }
+
+    /* Unpack the protbuf */
+    kds_cmd = kismet_external__command__unpack(NULL, packet_sz, external_frame->data);
+
+    if (kds_cmd == NULL) {
+        fprintf(stderr, "FATAL:  Invalid frame received, unable to unpack command\n");
+        kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
         return -1;
     }
 
     /* Lock so we can look at callbacks */
     pthread_mutex_lock(&(caph->handler_lock));
 
-    if (strncasecmp(cap_proto_frame->header.type, "LISTINTERFACES", 16) == 0) {
+    /* Split into commands and handle them */
+    if (strcasecmp(kds_cmd->command, "PING") == 0) {
+        caph->last_ping = time(NULL);
+        cf_send_pong(caph, kds_cmd->seqno);
+        cbret = 1;
+        goto finish;
+    } else if (strcasecmp(kds_cmd->command, "PONG") == 0) {
+        cbret = 1;
+        goto finish;
+    } else if (strcasecmp(kds_cmd->command, "KDSLISTINTERFACES") == 0) {
         if (caph->listdevices_cb == NULL) {
-            pthread_mutex_unlock(&(caph->handler_lock));
-            cf_send_listresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                    true, "", NULL, 0);
+            cf_send_listresp(caph, kds_cmd->seqno, true, "", NULL, 0);
             cbret = -1;
+            goto finish;
         } else {
             cf_params_list_interface_t **interfaces = NULL;
             msgstr[0] = 0;
-            cbret = (*(caph->listdevices_cb))(caph, 
-                    ntohl(cap_proto_frame->header.sequence_number),
-                    msgstr, &interfaces);
+            cbret = (*(caph->listdevices_cb))(caph, kds_cmd->seqno, msgstr, &interfaces);
 
-            cf_send_listresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                    cbret >= 0, msgstr, interfaces, cbret < 0 ? 0 : cbret);
+            cf_send_listresp(caph, kds_cmd->seqno, cbret >= 0, msgstr, 
+                    interfaces, cbret < 0 ? 0 : cbret);
 
             if (cbret > 0) {
                 for (i = 0; i < (size_t) cbret; i++) {
@@ -1219,94 +1348,43 @@ int cf_handle_rx_data(kis_capture_handler_t *caph) {
 
             /* Always spin down after listing */
             cf_handler_spindown(caph);
-
-            pthread_mutex_unlock(&(caph->handler_lock));
+            goto finish;
         }
-    } else if (strncasecmp(cap_proto_frame->header.type, "PROBEDEVICE", 16) == 0) {
-        /* fprintf(stderr, "DEBUG - Got PROBEDEVICE request\n"); */
-
+    } else if (strcasecmp(kds_cmd->command, "KDSPROBESOURCE") == 0) {
         if (caph->probe_cb == NULL) {
             pthread_mutex_unlock(&(caph->handler_lock));
-            cf_send_proberesp(caph, ntohl(cap_proto_frame->header.sequence_number),
+            cf_send_proberesp(caph, kds_cmd->seqno,
                     false, "Source does not support probing", NULL, NULL);
             cbret = -1;
+            goto finish;
         } else {
-            char *def, *nuldef = NULL;
-            int def_len;
+            KismetDatasource__ProbeSource *probe_cmd = NULL;
 
             cf_params_interface_t *interfaceparams = NULL;
             cf_params_spectrum_t *spectrumparams = NULL;
 
             char *uuid = NULL;
-            
-            def_len = cf_get_DEFINITION(&def, cap_proto_frame);
 
-            if (def_len > 0) {
-                nuldef = strndup(def, def_len);
+            /* Unpack the protbuf */
+            probe_cmd = kismet_datasource__probe_source__unpack(NULL, kds_cmd->content.len, 
+                    kds_cmd->content.data);
+
+            if (probe_cmd == NULL) {
+                fprintf(stderr, "FATAL:  Invalid frame received, unable to unpack "
+                        "KDSPROBESOURCE command\n");
+                cbret = -1;
+                goto finish;
             }
-
+            
             msgstr[0] = 0;
             cbret = (*(caph->probe_cb))(caph,
-                    ntohl(cap_proto_frame->header.sequence_number), nuldef,
-                    msgstr, &uuid, cap_proto_frame, &interfaceparams, &spectrumparams);
+                    kds_cmd->seqno, probe_cmd->definition,
+                    msgstr, &uuid, kds_cmd, &interfaceparams, &spectrumparams);
 
-            cf_send_proberesp(caph, ntohl(cap_proto_frame->header.sequence_number),
+            cf_send_proberesp(caph, kds_cmd->seqno,
                     cbret < 0 ? 0 : cbret, msgstr, interfaceparams, spectrumparams);
 
-            if (nuldef != NULL)
-                free(nuldef);
-
-            if (interfaceparams != NULL)
-                cf_params_interface_free(interfaceparams);
-
-            if (spectrumparams != NULL)
-                cf_params_spectrum_free(spectrumparams);
-
-            /* Always spin down after probing */
-            cf_handler_spindown(caph);
-
-            pthread_mutex_unlock(&(caph->handler_lock));
-        }
-    } else if (strncasecmp(cap_proto_frame->header.type, "OPENDEVICE", 16) == 0) {
-        /* fprintf(stderr, "DEBUG - Got OPENDEVICE request\n"); */
-
-        if (caph->open_cb == NULL) {
-            pthread_mutex_unlock(&(caph->handler_lock));
-            cf_send_openresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                    false, "source cannot be opened", 0, NULL, NULL, NULL);
-            cbret = -1;
-        } else {
-            char *def, *nuldef = NULL;
-            int def_len;
-
-            uint32_t dlt;
-
-            cf_params_interface_t *interfaceparams = NULL;
-            cf_params_spectrum_t *spectrumparams = NULL;
-
-            char *uuid = NULL;
-            
-            def_len = cf_get_DEFINITION(&def, cap_proto_frame);
-
-            if (def_len > 0) {
-                nuldef = strndup(def, def_len);
-            } else {
-                fprintf(stderr, "FATAL - Got OPENDEVICE with no definition\n");
-                return -1;
-            }
-
-            msgstr[0] = 0;
-            cbret = (*(caph->open_cb))(caph,
-                    ntohl(cap_proto_frame->header.sequence_number), nuldef,
-                    msgstr, &dlt, &uuid, cap_proto_frame,
-                    &interfaceparams, &spectrumparams);
-
-            cf_send_openresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                    cbret < 0 ? 0 : cbret, msgstr, dlt, uuid, interfaceparams,
-                    spectrumparams);
-
-            if (nuldef != NULL)
-                free(nuldef);
+            kismet_datasource__probe_source__free_unpacked(probe_cmd, NULL);
 
             if (uuid != NULL)
                 free(uuid);
@@ -1317,6 +1395,58 @@ int cf_handle_rx_data(kis_capture_handler_t *caph) {
             if (spectrumparams != NULL)
                 cf_params_spectrum_free(spectrumparams);
 
+            /* Always spin down after probing */
+            cf_handler_spindown(caph);
+
+            goto finish;
+        }
+    } else if (strcasecmp(kds_cmd->command, "KDSOPENSOURCE") == 0) {
+        if (caph->open_cb == NULL) {
+            pthread_mutex_unlock(&(caph->handler_lock));
+            cf_send_openresp(caph, kds_cmd->seqno,
+                    false, "source cannot be opened", 0, NULL, NULL, NULL);
+            cbret = -1;
+        } else {
+            KismetDatasource__OpenSource *open_cmd = NULL;
+
+            uint32_t dlt;
+
+            cf_params_interface_t *interfaceparams = NULL;
+            cf_params_spectrum_t *spectrumparams = NULL;
+
+            char *uuid = NULL;
+
+            /* Unpack the protbuf */
+            open_cmd = kismet_datasource__open_source__unpack(NULL, kds_cmd->content.len, 
+                    kds_cmd->content.data);
+
+            if (open_cmd == NULL) {
+                fprintf(stderr, "FATAL:  Invalid frame received, unable to unpack "
+                        "KDSOPENSOURCE command\n");
+                cbret = -1;
+                goto finish;
+            }
+            
+            msgstr[0] = 0;
+            cbret = (*(caph->open_cb))(caph,
+                    kds_cmd->seqno, open_cmd->definition,
+                    msgstr, &dlt, &uuid, kds_cmd,
+                    &interfaceparams, &spectrumparams);
+
+            cf_send_openresp(caph, kds_cmd->seqno,
+                    cbret < 0 ? 0 : cbret, msgstr, dlt, uuid, interfaceparams,
+                    spectrumparams);
+
+            if (uuid != NULL)
+                free(uuid);
+
+            if (interfaceparams != NULL)
+                cf_params_interface_free(interfaceparams);
+
+            if (spectrumparams != NULL)
+                cf_params_spectrum_free(spectrumparams);
+
+            kismet_datasource__open_source__free_unpacked(open_cmd, NULL);
 
             if (caph->remote_host) {
                 fprintf(stderr, "INFO - %s:%u starting capture...\n",
@@ -1327,45 +1457,45 @@ int cf_handle_rx_data(kis_capture_handler_t *caph) {
                 cf_handler_launch_capture_thread(caph);
             }
 
-            pthread_mutex_unlock(&(caph->handler_lock));
+            goto finish;
+        }
+    } else if (strcasecmp(kds_cmd->command, "KDSCONFIGURE") == 0) {
+        KismetDatasource__Configure *conf_cmd;
+
+        double chanhop_rate;
+        char **chanhop_channels = NULL;
+        void **chanhop_priv_channels = NULL;
+        size_t chanhop_channels_sz, szi;
+        int chanhop_shuffle = 0, chanhop_shuffle_spacing = 1, chanhop_offset = 0;
+        void *translate_chan = NULL;
+
+        /* Unpack the protbuf */
+        conf_cmd = kismet_datasource__configure__unpack(NULL, kds_cmd->content.len, 
+                kds_cmd->content.data);
+
+        if (conf_cmd == NULL) {
+            fprintf(stderr, "FATAL:  Invalid frame received, unable to unpack "
+                    "KDSCONFIGURE command\n");
+            cbret = -1;
+            goto finish;
         }
 
-    } else if (strncasecmp(cap_proto_frame->header.type, "CONFIGURE", 16) == 0) {
-        char *cdef, *chanset_channel;
-        double chanhop_rate;
-        char **chanhop_channels;
-        void **chanhop_priv_channels;
-        size_t chanhop_channels_sz, szi;
-        int chanhop_shuffle = 0, chanhop_offset = 0;
-        void *translate_chan;
-        int r;
-
-        /* fprintf(stderr, "DEBUG - Got CONFIGURE request\n"); */
-
-        /* Look to see if we have a CHANSET command */
-        r = cf_get_CHANSET(&cdef, cap_proto_frame);
-
-        if (r < 0) {
-            cf_send_configresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                    0, "Unable to parse CHANSET KV");
-            cbret = -1;
-        } else if (r > 0) {
+        if (conf_cmd->channel != NULL) {
+            /* Handle channel set */
             if (caph->chancontrol_cb == NULL) {
                 pthread_mutex_unlock(&(caph->handler_lock));
-                cf_send_configresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                        0, "Source does not support setting channel");
+                cf_send_configresp(caph, kds_cmd->seqno,
+                        0, "Source does not support setting channel", NULL);
                 cbret = 0;
+
+                kismet_datasource__configure__free_unpacked(conf_cmd, NULL);
+                goto finish;
             } else {
-                chanset_channel = strndup(cdef, r);
-
                 if (caph->chantranslate_cb != NULL) {
-                    translate_chan = (*(caph->chantranslate_cb))(caph, chanset_channel);
+                    translate_chan = (*(caph->chantranslate_cb))(caph, conf_cmd->channel->channel);
                 } else {
-                    translate_chan = strdup(chanset_channel);
+                    translate_chan = strdup(conf_cmd->channel->channel);
                 }
-
-                /* Cancel channel hopping */
-                caph->channel_hop_rate = 0;
 
                 if (caph->hopping_running) {
                     pthread_cancel(caph->hopthread);
@@ -1374,83 +1504,111 @@ int cf_handle_rx_data(kis_capture_handler_t *caph) {
 
                 msgstr[0] = 0;
                 cbret = (*(caph->chancontrol_cb))(caph,
-                        ntohl(cap_proto_frame->header.sequence_number), 
+                        kds_cmd->seqno,
                         translate_chan, msgstr);
 
+                /* Log the channel we're set to */
+                if (cbret > 0) {
+                    if (caph->channel != NULL)
+                        free(caph->channel);
+                    caph->channel = strdup(conf_cmd->channel->channel);
+                }
+
                 /* Send a response based on the channel set success */
-                cf_send_configresp_channel(caph, 
-                        ntohl(cap_proto_frame->header.sequence_number), 
-                        cbret >= 0, msgstr, chanset_channel);
+                cf_send_configresp(caph, kds_cmd->seqno, cbret >= 0, msgstr, NULL);
 
                 /* Free our channel copies */
-
-                free(chanset_channel);
-
                 if (caph->chanfree_cb != NULL)
                     (*(caph->chanfree_cb))(translate_chan);
                 else
                     free(translate_chan);
 
-                pthread_mutex_unlock(&(caph->handler_lock));
+                kismet_datasource__configure__free_unpacked(conf_cmd, NULL);
+
+                goto finish;
             }
-        } else {
-            /* We didn't find a CHANSET, look for CHANHOP.  We only respect one;
-             * we'll never look at a CHANHOP if we got a CHANSET */
-            r = cf_get_CHANHOP(&chanhop_rate, &chanhop_channels, &chanhop_channels_sz,
-                    &chanhop_shuffle, &chanhop_offset, cap_proto_frame);
 
-            if (r < 0 || chanhop_channels_sz == 0) {
-                cf_send_configresp(caph, ntohl(cap_proto_frame->header.sequence_number),
-                        0, "Unable to parse CHANHOP KV");
+        } else if (conf_cmd->hopping != NULL) {
+            /* Otherwise process hopping */
+            if (conf_cmd->hopping->n_channels == 0) {
+                cf_send_configresp(caph, kds_cmd->seqno, 0, 
+                        "No channels in hopping configuration", NULL);
                 cbret = -1;
-            } else if (r > 0) {
-                if (caph->chancontrol_cb == NULL) {
-                    pthread_mutex_unlock(&(caph->handler_lock));
-                    cf_send_configresp(caph, 
-                            ntohl(cap_proto_frame->header.sequence_number),
-                            0, "Source does not support setting channel");
-                    cbret = -1;
+
+                kismet_datasource__configure__free_unpacked(conf_cmd, NULL);
+
+                goto finish;
+            }
+
+            if (caph->chancontrol_cb == NULL) {
+                cf_send_configresp(caph, kds_cmd->seqno, 0, 
+                        "Source does not support setting channel", NULL);
+                cbret = -1;
+
+                kismet_datasource__configure__free_unpacked(conf_cmd, NULL);
+
+                goto finish;
+            }
+
+            chanhop_channels_sz = conf_cmd->hopping->n_channels;
+
+            chanhop_channels = 
+                (char **) malloc(sizeof(char *) * chanhop_channels_sz);
+
+            for (szi = 0; szi < chanhop_channels_sz; szi++) {
+                chanhop_channels[szi] = strdup(conf_cmd->hopping->channels[szi]);
+            }
+
+            /* Translate all the channels, or dupe them as strings */
+            chanhop_priv_channels = 
+                (void **) malloc(sizeof(void *) * chanhop_channels_sz);
+
+            for (szi = 0; szi < chanhop_channels_sz; szi++) {
+                if (caph->chantranslate_cb != NULL) {
+                    chanhop_priv_channels[szi] = 
+                        (*(caph->chantranslate_cb))(caph, conf_cmd->hopping->channels[szi]);
                 } else {
-                    /* Translate all the channels, or dupe them as strings */
-                    chanhop_priv_channels = 
-                        (void **) malloc(sizeof(void *) * chanhop_channels_sz);
-
-                    for (szi = 0; szi < chanhop_channels_sz; szi++) {
-                        if (caph->chantranslate_cb != NULL) {
-                            chanhop_priv_channels[szi] = 
-                                (*(caph->chantranslate_cb))(caph, chanhop_channels[szi]);
-                        } else {
-                            chanhop_priv_channels[szi] = strdup(chanhop_channels[szi]);
-                        }
-                    }
-
-                    /* Set the hop data, which will handle our thread */
-                    cf_handler_assign_hop_channels(caph, chanhop_channels,
-                            chanhop_priv_channels, chanhop_channels_sz, chanhop_rate,
-                            chanhop_shuffle, chanhop_offset);
-
-                    /* Return a completion, and we do NOT free the channel lists we
-                     * dynamically allocated out of the buffer with cf_get_CHANHOP, as
-                     * we're now using them for keeping the channel record in the
-                     * caph */
-                    cf_send_configresp_chanhop(caph, 
-                            ntohl(cap_proto_frame->header.sequence_number), 1, NULL,
-                            chanhop_rate, chanhop_channels, chanhop_channels_sz);
-
-                    pthread_mutex_unlock(&(caph->handler_lock));
-
-                    cbret = 1;
+                    chanhop_priv_channels[szi] = strdup(conf_cmd->hopping->channels[szi]);
                 }
             }
+
+            /* Load any configure options or default to what we're already set for */
+            if (conf_cmd->hopping->has_rate)
+                chanhop_rate = conf_cmd->hopping->rate;
+            else
+                chanhop_rate = caph->channel_hop_rate;
+
+            if (conf_cmd->hopping->has_shuffle)
+                chanhop_shuffle = conf_cmd->hopping->shuffle;
+            else
+                chanhop_shuffle = caph->channel_hop_shuffle;
+
+            if (conf_cmd->hopping->has_shuffle_skip) 
+                chanhop_shuffle_spacing = conf_cmd->hopping->shuffle_skip;
+             else 
+                chanhop_shuffle_spacing = caph->channel_hop_shuffle_spacing;
+
+            if (conf_cmd->hopping->has_offset)
+                chanhop_offset = conf_cmd->hopping->offset;
+            else
+                chanhop_offset = caph->channel_hop_offset;
+
+            /* Set the hop data, which will handle our thread */
+            cf_handler_assign_hop_channels(caph, chanhop_channels,
+                    chanhop_priv_channels, chanhop_channels_sz, chanhop_rate,
+                    chanhop_shuffle, chanhop_shuffle_spacing, chanhop_offset);
+
+            /* Return a completion, and we do NOT free the channel lists we
+             * dynamically allocated out of the buffer with cf_get_CHANHOP, as
+             * we're now using them for keeping the channel record in the
+             * caph */
+            cf_send_configresp(caph, kds_cmd->seqno, 1, NULL, NULL);
+            cbret = 1;
+
+            kismet_datasource__configure__free_unpacked(conf_cmd, NULL);
+
+            goto finish;
         }
-
-    } else if (strncasecmp(cap_proto_frame->header.type, "PING", 16) == 0) {
-        caph->last_ping = time(NULL);
-        cf_send_pong(caph);
-
-        cbret = 1;
-
-        pthread_mutex_unlock(&(caph->handler_lock));
     } else {
         /* fprintf(stderr, "DEBUG - got unhandled request - '%.16s'\n", cap_proto_frame->header.type); */
         cbret = -1;
@@ -1459,205 +1617,212 @@ int cf_handle_rx_data(kis_capture_handler_t *caph) {
          * frame */
         if (caph->unknown_cb != NULL) {
             cbret = 
-                (*(caph->unknown_cb))(caph, ntohl(cap_proto_frame->header.sequence_number),
-                        cap_proto_frame);
+                (*(caph->unknown_cb))(caph, kds_cmd->seqno, kds_cmd);
         }
 
         if (cbret < 0) {
             pthread_mutex_unlock(&(caph->handler_lock));
-            cf_send_proberesp(caph, ntohl(cap_proto_frame->header.sequence_number),
+            cf_send_proberesp(caph, kds_cmd->seqno,
                     false, "Unsupported request", NULL, NULL);
         }
-
-        pthread_mutex_unlock(&(caph->handler_lock));
     }
+    
 
-    free(frame_buf);
+finish:
+    kis_simple_ringbuf_peek_free(caph->in_ringbuf, frame_buf);
+
+    /* Clear it out from the buffer */
+    kis_simple_ringbuf_read(caph->in_ringbuf, NULL, total_sz);
+
+    pthread_mutex_unlock(&(caph->handler_lock));
+    kismet_external__command__free_unpacked(kds_cmd, NULL);
 
     return cbret;
 }
 
-int cf_get_DEFINITION(char **ret_definition, simple_cap_proto_frame_t *in_frame) {
-    simple_cap_proto_kv_t *def_kv = NULL;
-    int def_len;
+int cf_handler_remote_server(kis_capture_handler_t *caph) {
+    struct sockaddr_in serv_sock;
 
-    def_len = find_simple_cap_proto_kv(in_frame, "DEFINITION", &def_kv);
+    struct sockaddr_in client_addr;
+#ifdef HAVE_SOCKLEN_T
+    socklen_t client_len;
+#else
+    int client_len;
+#endif
 
-    if (def_len <= 0) {
-        *ret_definition = NULL;
-        return def_len;
+    fd_set rset;
+    int max_fd;
+
+    int ret;
+
+    char msgstr[STATUS_MAX];
+    char *uuid = NULL;
+    int cbret;
+
+    cf_params_interface_t *cpi;
+    cf_params_spectrum_t *cps;
+
+    /* If we have nothing to connect to... */
+    if (caph->remote_host == NULL)
+        return 0;
+
+    /* close the fd if it's open */
+    if (caph->tcp_fd >= 0) {
+        close(caph->tcp_fd);
+        caph->tcp_fd = -1;
     }
 
-    *ret_definition = (char *) def_kv->object;
-    return def_len;
-}
+    /* Reset the last ping */
+    caph->last_ping = time(0);
 
-int cf_get_CHANSET(char **ret_definition, simple_cap_proto_frame_t *in_frame) {
-    simple_cap_proto_kv_t *ch_kv = NULL;
-    int ch_len;
+    /* Reset spindown */
+    caph->spindown = 0;
 
-    ch_len = find_simple_cap_proto_kv(in_frame, "CHANSET", &ch_kv);
+    /* Clear the buffers */
+    kis_simple_ringbuf_clear(caph->in_ringbuf);
+    kis_simple_ringbuf_clear(caph->out_ringbuf);
 
-    if (ch_len <= 0) {
-        *ret_definition = NULL;
-        return ch_len;
-    }
+    /* Perform a local probe on the source to see if it's valid */
+    msgstr[0] = 0;
 
-    *ret_definition = (char *) ch_kv->object;
-    return ch_len;
-}
+    cpi = NULL;
+    cps = NULL;
 
-int cf_get_CHANHOP(double *hop_rate, char ***ret_channel_list,
-        size_t *ret_channel_list_sz, int *ret_shuffle, int *ret_offset,
-        simple_cap_proto_frame_t *in_frame) {
-    simple_cap_proto_kv_t *ch_kv = NULL;
-    int ch_len;
-
-    /* msgpuck validation */
-    const char *mp_end;
-    const char *mp_buf;
-    int mp_ret;
-    const char *sval;
-    uint32_t sval_len;
-    uint32_t dict_size, chan_size;
-    uint32_t dict_itr, chan_itr;
-
-    *ret_channel_list = NULL;
-    *ret_channel_list_sz = 0;
-    *hop_rate = 0;
-    *ret_offset = 0;
-    *ret_shuffle = 0;
-
-    ch_len = find_simple_cap_proto_kv(in_frame, "CHANHOP", &ch_kv);
-
-    if (ch_len <= 0) {
-        return ch_len;
-    }
-
-    /* Validate the msgpack data before we try to parse it */
-
-    mp_buf = (char *) ch_kv->object;
-    mp_end = mp_buf + ntohl(ch_kv->header.obj_sz);
-
-    if ((mp_ret = mp_check(&mp_buf, mp_end)) != 0 ||
-            mp_buf != mp_end) {
-        /* fprintf(stderr, "debug - chanhop failed mp_check\n"); */
+    if (caph->probe_cb == NULL) {
+        fprintf(stderr, "FATAL - unable to connect as remote source when no probe callback "
+                "provided.\n");
         return -1;
     }
 
-    /* Reset the buffer position to the start of the object */
-    mp_buf = (char *) ch_kv->object;
+    cbret = (*(caph->probe_cb))(caph, 0, caph->cli_sourcedef, msgstr, &uuid, 
+            NULL, &cpi, &cps);
 
-    /* Get all the elements in the dictionary */
-    dict_size = mp_decode_map(&mp_buf);
-    for (dict_itr = 0; dict_itr < dict_size; dict_itr++) {
-        sval = mp_decode_str(&mp_buf, &sval_len);
+    if (cpi != NULL)
+        cf_params_interface_free(cpi);
 
-        if (strncasecmp(sval, "rate", sval_len) == 0) {
-            *hop_rate = mp_decode_double(&mp_buf);
-        } else if (strncasecmp(sval, "shuffle", sval_len) == 0) {
-            *ret_shuffle = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "offset", sval_len) == 0) {
-            *ret_offset = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "channels", sval_len) == 0) {
-            if (*ret_channel_list != NULL) {
-                /* fprintf(stderr, "debug - duplicate channels list in chanhop\n"); */
-                return -1;
+    if (cps != NULL)
+        cf_params_spectrum_free(cps);
+
+    if (cbret <= 0) {
+        fprintf(stderr, "FATAL - Could not probe local source prior to connecting to the "
+                "remote host: %s\n", msgstr);
+
+        if (uuid)
+            free(uuid);
+    
+        return -1;
+    }
+
+    memset(&serv_sock, 0, sizeof(serv_sock));
+    serv_sock.sin_family = AF_INET;
+    serv_sock.sin_port = htons(caph->remote_port);
+
+    if (strcmp(caph->remote_host, "*") == 0) {
+        serv_sock.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, caph->remote_host, &(serv_sock.sin_addr.s_addr)) == 0) {
+        fprintf(stderr, "FATAL - unable to resolve '%s' as bind address, use '*:port' to bind to all interfaces.\n", caph->remote_host);
+        return -1;
+    }
+
+#ifdef SOCK_CLOEXEC
+    if ((caph->listen_fd = socket(AF_INET, SOCK_CLOEXEC | SOCK_STREAM, 0)) < 0) {
+        fprintf(stderr, "FATAL - unable to create listening socket: %s\n", strerror(errno));
+        return -1;
+    }
+#else
+    if ((caph->listen_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        fprintf(stderr, "FATAL - unable to create listening socket: %s\n", strerror(errno));
+        return -1;
+    }
+    fcntl(caph->listen_fd, F_SETFL, fcntl(caph->listen_fd, F_GETFL, 0) | O_CLOEXEC);
+#endif
+
+    int i = 2;
+    if (setsockopt(caph->listen_fd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) == -1) {
+        fprintf(stderr, "FATAL - Unable to set options on server socket: %s\n", strerror(errno));
+        close(caph->listen_fd);
+        return -1;
+    }
+
+    if (bind(caph->listen_fd, (struct sockaddr *) &serv_sock, sizeof(serv_sock)) < 0) {
+        fprintf(stderr, "FATAL - Unable to bind server socket: %s\n", strerror(errno));
+        close(caph->listen_fd);
+        return -1;
+    }
+
+    // Enable listening, with a small queue
+    if (listen(caph->listen_fd, 5) < 0) {
+        fprintf(stderr, "FATAL - Unable to listen on server socket: %s\n", strerror(errno));
+        close(caph->listen_fd);
+        return -1;
+    }
+
+    // Set it to nonblocking 
+    fcntl(caph->listen_fd, F_SETFL, fcntl(caph->listen_fd, F_GETFL, 0) | O_NONBLOCK);
+
+    // Wait for a connection
+    fprintf(stderr, "INFO - Waiting for incoming remote connection...\n");
+
+    while (1) {
+        FD_ZERO(&rset);
+        FD_SET(caph->listen_fd, &rset);
+        max_fd = caph->listen_fd;
+
+        if ((ret = select(max_fd + 1, &rset, NULL, NULL, NULL)) < 0) {
+            if (errno != EINTR && errno != EAGAIN) {
+                fprintf(stderr, "FATAL:  Error during remote setup select(): %s\n", strerror(errno));
+                break;
             }
+        }
 
-            chan_size = mp_decode_array(&mp_buf);
+        if (ret == 0)
+            continue;
 
-            if (chan_size > 0) {
-                *ret_channel_list = (char **) malloc(sizeof(char *) * chan_size);
-                if (*ret_channel_list == NULL) {
-                    /* fprintf(stderr, "debug - chanhop failed to allocate channels\n"); */
+        if (FD_ISSET(caph->listen_fd, &rset)) {
+            memset(&client_addr, 0, sizeof(struct sockaddr_in));
+            client_len = sizeof(struct sockaddr_in);
+
+#ifdef SOCK_CLOEXEC
+            if ((caph->tcp_fd = accept4(caph->listen_fd, (struct sockaddr *) &client_addr, &client_len, SOCK_CLOEXEC)) < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    fprintf(stderr, "FATAL:  Remote TCP server accept() failed: %s\n", strerror(errno));
+                    close(caph->listen_fd);
                     return -1;
                 }
 
-                for (chan_itr = 0; chan_itr < chan_size; chan_itr++) {
-                    /* Re-use our sval */
-                    sval = mp_decode_str(&mp_buf, &sval_len);
-
-                    /* Dupe the channel into our list */
-                    (*ret_channel_list)[chan_itr] = strndup(sval, sval_len);
+                continue;
+            }
+#else
+            if ((caph->tcp_fd = accept(caph->listen_fd, (struct sockaddr *) &client_addr, &client_len)) < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    fprintf(stderr, "FATAL: remote TCP server accept() failed: %s\n", strerror(errno));
+                    close(caph->listen_fd);
+                    return -1;
                 }
 
-                *ret_channel_list_sz = chan_size;
-            } else {
-                *ret_channel_list_sz = 0;
-                *ret_channel_list = NULL;
+                continue;
             }
+
+            fcntl(caph->tcp_fd, F_SETFL, fcntl(caph->tcp_fd, F_GETFL, 0) | O_CLOEXEC);
+#endif
+
         }
     }
-    
-    return chan_size;
-}
 
-int cf_get_SPECSET(uint64_t *ret_start_mhz, uint64_t *ret_end_mhz,
-        uint64_t *ret_num_freq, uint64_t *ret_bin_width,
-        uint8_t *ret_amp, uint64_t *ret_if_amp, uint64_t *ret_baseband_amp,
-        simple_cap_proto_frame_t *in_frame) {
+    fcntl(caph->tcp_fd, F_SETFL, fcntl(caph->tcp_fd, F_GETFL, 0) | O_NONBLOCK);
 
-    simple_cap_proto_kv_t *specset_kv = NULL;
-    int specset_len;
+    /* close the server because we only allow one connection; in the future this might
+     * be an opportunity to define an error message and return that.
+     */
+    close(caph->listen_fd);
 
-    /* msgpuck validation */
-    const char *mp_end;
-    const char *mp_buf;
-    int mp_ret;
-    const char *sval;
-    uint32_t sval_len;
-    uint32_t dict_size;
-    uint32_t dict_itr;
+    fprintf(stderr, "INFO - Accepting connection from '%s'\n", inet_ntoa(client_addr.sin_addr));
 
-    *ret_start_mhz = 0;
-    *ret_end_mhz = 0;
-    *ret_num_freq = 0;
-    *ret_bin_width = 0;
-    *ret_amp = 0;
-    *ret_if_amp = 0;
-    *ret_baseband_amp = 0;
+    /* Send the NEWSOURCE command to the Kismet server */
+    cf_send_newsource(caph, uuid);
 
-    specset_len = find_simple_cap_proto_kv(in_frame, "SPECSET", &specset_kv);
-
-    if (specset_len <= 0) {
-        return specset_len;
-    }
-
-    /* Validate the msgpack data before we try to parse it */
-
-    mp_buf = (char *) specset_kv->object;
-    mp_end = mp_buf + ntohl(specset_kv->header.obj_sz);
-
-    if ((mp_ret = mp_check(&mp_buf, mp_end)) != 0 ||
-            mp_buf != mp_end) {
-        return -1;
-    }
-
-    /* Reset the buffer position to the start of the object */
-    mp_buf = (char *) specset_kv->object;
-
-    /* Get all the elements in the dictionary */
-    dict_size = mp_decode_map(&mp_buf);
-    for (dict_itr = 0; dict_itr < dict_size; dict_itr++) {
-        sval = mp_decode_str(&mp_buf, &sval_len);
-
-        if (strncasecmp(sval, "start_mhz", sval_len) == 0) {
-            *ret_start_mhz = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "end_mhz", sval_len) == 0) {
-            *ret_end_mhz = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "samples_per_freq", sval_len) == 0) {
-            *ret_num_freq = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "bin_with", sval_len) == 0) {
-            *ret_bin_width = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "amp", sval_len) == 0) {
-            *ret_amp = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "if_amp", sval_len) == 0) {
-            *ret_if_amp = mp_decode_uint(&mp_buf);
-        } else if (strncasecmp(sval, "baseband_amp", sval_len) == 0) {
-            *ret_baseband_amp = mp_decode_uint(&mp_buf);
-        }
-    }
+    if (uuid)
+        free(uuid);
 
     return 1;
 }
@@ -1681,7 +1846,7 @@ int cf_handler_remote_connect(kis_capture_handler_t *caph) {
     if (caph->remote_host == NULL)
         return 0;
 
-    /* Close the fd if it's open */
+    /* close the fd if it's open */
     if (caph->tcp_fd >= 0) {
         close(caph->tcp_fd);
         caph->tcp_fd = -1;
@@ -1898,11 +2063,24 @@ int cf_handler_loop(kis_capture_handler_t *caph) {
                 ssize_t amt_read;
                 size_t amt_buffered;
                 uint8_t rbuf[1024];
+                size_t maxread = 0;
 
-                /* We deliberately read as much as we need and try to put it in the 
-                 * buffer, if the buffer fills up something has gone wrong anyhow */
+                /* Read don't read more than we can handle in the buffer or in our
+                 * read slot */
+                maxread = kis_simple_ringbuf_available(caph->in_ringbuf);
 
-                if ((amt_read = read(read_fd, rbuf, 1024)) <= 0) {
+                if (maxread > 1024)
+                    maxread = 1024;
+
+                /* If it looks like we're doing remote cap over tcp, use recv because
+                 * OSX seems to ignore O_NONBLOCK; on the other hand, if it's IPC over
+                 * pipes, we HAVE to use read because recv will fail! */
+                if (caph->remote_host != NULL)
+                    amt_read = recv(read_fd, rbuf, maxread, MSG_DONTWAIT);
+                else
+                    amt_read = read(read_fd, rbuf, maxread);
+
+                if (amt_read <= 0) {
                     if (errno != EINTR && errno != EAGAIN) {
                         /* Bail entirely */
                         if (amt_read == 0) {
@@ -1972,7 +2150,13 @@ int cf_handler_loop(kis_capture_handler_t *caph) {
 
             /* fprintf(stderr, "debug - peeked %lu\n", peeked_sz); */
 
-            if ((written_sz = write(write_fd, peek_buf, peeked_sz)) < 0) {
+            /* Same nonsense as before - send on tcp, write on pipes */
+            if (caph->remote_host != NULL)
+                written_sz = send(write_fd, peek_buf, peeked_sz, MSG_DONTWAIT);
+            else
+                written_sz = write(write_fd, peek_buf, peeked_sz);
+
+            if (written_sz < 0) {
                 if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
                     pthread_mutex_unlock(&(caph->out_ringbuf_lock));
                     fprintf(stderr,
@@ -2029,821 +2213,729 @@ int cf_send_raw_bytes(kis_capture_handler_t *caph, uint8_t *data, size_t len) {
     return 1;
 }
 
-int cf_stream_packet(kis_capture_handler_t *caph, const char *packtype,
-        simple_cap_proto_kv_t **in_kv_list, unsigned int in_kv_len) {
+int cf_send_packet(kis_capture_handler_t *caph, const char *packtype,
+        uint8_t *data, size_t len) {
+    uint32_t seqno;
+    KismetExternal__Command cmd;
 
-    /* Proto header we write to the buffer */
-    simple_cap_proto_t *proto_hdr;
-    size_t proto_sz;
+    /* Frame we'll be sending */
+    kismet_external_frame_t *frame;
+    /* Size of serialized command data */
+    size_t data_sz;
+    /* Buffer holding all of it */
+    uint8_t *send_buffer;
+    /* Calculated checksum */
+    uint32_t calc_checksum;
 
-    size_t i;
+    int r;
 
-    /* Encode a header */
-    proto_hdr = encode_simple_cap_proto_hdr(&proto_sz, packtype, 0, 
-            in_kv_list, in_kv_len);
+    kismet_external__command__init(&cmd);
 
-    if (proto_hdr == NULL) {
-        fprintf(stderr, "FATAL: Unable to allocate protocol frame header\n");
-        for (i = 0; i < in_kv_len; i++) {
-            free(in_kv_list[i]);
-        }
-        free(in_kv_list);
+    /* Lock the handler and get the next sequence number */
+    pthread_mutex_lock(&(caph->handler_lock));
+    if (++caph->seqno == 0)
+        caph->seqno = 1;
+    seqno = caph->seqno;
+    pthread_mutex_unlock(&(caph->handler_lock));
+
+    cmd.seqno = seqno;
+    cmd.command = strdup(packtype);
+    cmd.content.data = data;
+    cmd.content.len = len;
+   
+    data_sz = kismet_external__command__get_packed_size(&cmd);
+    send_buffer = (uint8_t *) malloc(data_sz + sizeof(kismet_external_frame_t));
+
+    if (send_buffer == NULL) {
+        fprintf(stderr, "FATAL:  Unable to allocate the buffer for writing a packet");
+        free(cmd.command);
+        free(data);
         return -1;
     }
 
-    /* 
-     fprintf(stderr, "debug - trying to write streaming packet '%s' len %lu\n", packtype, proto_sz);
-     */
+    /* Map to the tx frame */
+    frame = (kismet_external_frame_t *) send_buffer;
 
-    pthread_mutex_lock(&(caph->out_ringbuf_lock));
+    /* Set the signature and data size */
+    frame->signature = htonl(KIS_EXTERNAL_PROTO_SIG);
+    frame->data_sz = htonl(data_sz);
 
-    if (kis_simple_ringbuf_available(caph->out_ringbuf) < proto_sz) {
-        pthread_mutex_unlock(&(caph->out_ringbuf_lock));
-        for (i = 0; i < in_kv_len; i++) {
-            free(in_kv_list[i]);
-        }
-        free(in_kv_list);
-        free(proto_hdr);
-        return 0;
-    }
+    /* serialize into the data payload of the frame */
+    kismet_external__command__pack(&cmd, frame->data);
 
-    /* Write the header out */
-    kis_simple_ringbuf_write(caph->out_ringbuf, (uint8_t *) proto_hdr, 
-            sizeof(simple_cap_proto_t));
+    /* Checksum the data payload */
+    calc_checksum = adler32_csum(frame->data, data_sz);
 
-    /* Write all the kv pairs out */
-    for (i = 0; i < in_kv_len; i++) {
-        simple_cap_proto_kv_t *kv = in_kv_list[i];
+    frame->data_checksum = htonl(calc_checksum);
 
-        kis_simple_ringbuf_write(caph->out_ringbuf, (uint8_t *) kv,
-                ntohl(kv->header.obj_sz) + sizeof(simple_cap_proto_kv_t));
+    /* Send the whole frame */
+    r = cf_send_raw_bytes(caph, send_buffer, data_sz + sizeof(kismet_external_frame_t));
 
-        free(in_kv_list[i]);
-    }
+    free(send_buffer);
+    free(data);
+    free(cmd.command);
 
-    if (in_kv_list != NULL)
-        free(in_kv_list);
-
-    free(proto_hdr);
-
-    pthread_mutex_unlock(&(caph->out_ringbuf_lock));
-
-    return 1;
+    return r;
 }
 
 int cf_send_message(kis_capture_handler_t *caph, const char *msg, unsigned int flags) {
-    /* How many KV pairs are we allocating?  1 for success for sure */
-    size_t num_kvs = 1;
+    KismetExternal__MsgbusMessage kemsg;
+    uint8_t *buf;
+    size_t len;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    kismet_external__msgbus_message__init(&kemsg);
 
-    if (caph->tcp_fd < 0 && caph->out_fd < 0) {
-        const char *type;
+    kemsg.msgtext = strdup(msg);
+    kemsg.msgtype = (KismetExternal__MsgbusMessage__MessageType) flags;
 
-        if (flags & MSGFLAG_INFO)
-            type = "INFO";
-        else if (flags & MSGFLAG_ERROR)
-            type = "ERROR";
-        else
-            type = "DEBUG";
+    len = kismet_external__msgbus_message__get_packed_size(&kemsg);
+    buf = (uint8_t *) malloc(len);
 
-        fprintf(stderr, "%s: %s\n", type, msg);
-        return 0;
-    }
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    kv_pairs[0] = encode_kv_message(msg, flags);
-
-    if (kv_pairs[0] == NULL) {
-        free(kv_pairs);
+    if (buf == NULL) {
+        free(kemsg.msgtext);
         return -1;
     }
 
-    return cf_stream_packet(caph, "MESSAGE", kv_pairs, 1);
+    kismet_external__msgbus_message__pack(&kemsg, buf);
+
+    free(kemsg.msgtext);
+
+    return cf_send_packet(caph, "MESSAGE", buf, len);
 }
 
-int cf_send_warning(kis_capture_handler_t *caph, const char *msg, unsigned int flags,
-        const char *warning) {
-    /* How many KV pairs are we allocating?  1 for success for sure */
-    size_t num_kvs = 2;
+int cf_send_warning(kis_capture_handler_t *caph, const char *warning) {
+    KismetDatasource__WarningReport kewarning;
+    uint8_t *buf;
+    size_t len;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    kismet_datasource__warning_report__init(&kewarning);
 
-    if (caph->tcp_fd < 0 && caph->out_fd < 0) {
-        const char *type;
+    kewarning.warning = strdup(warning);
 
-        if (flags & MSGFLAG_INFO)
-            type = "INFO";
-        else if (flags & MSGFLAG_ERROR)
-            type = "ERROR";
-        else
-            type = "DEBUG";
+    len = kismet_datasource__warning_report__get_packed_size(&kewarning);
+    buf = (uint8_t *) malloc(len);
 
-        fprintf(stderr, "%s: %s\n", type, warning);
-        return 0;
-    }
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    kv_pairs[0] = encode_kv_message(msg, flags);
-
-    if (kv_pairs[0] == NULL) {
-        free(kv_pairs);
+    if (buf == NULL) {
+        free(kewarning.warning);
         return -1;
     }
 
-    kv_pairs[1] = encode_kv_warning(warning);
+    kismet_datasource__warning_report__pack(&kewarning, buf);
 
-    if (kv_pairs[1] == NULL) {
-        free(kv_pairs[0]);
-        free(kv_pairs);
-        return -1;
-    }
+    free(kewarning.warning);
 
-    return cf_stream_packet(caph, "MESSAGE", kv_pairs, 1);
+    return cf_send_packet(caph, "KDSWARNINGREPORT", buf, len);
 }
 
-int cf_send_error(kis_capture_handler_t *caph, const char *msg) {
-    size_t num_kvs = 2;
+int cf_send_error(kis_capture_handler_t *caph, uint32_t in_seqno, const char *msg) {
+    KismetDatasource__ErrorReport keerror;
+    KismetDatasource__SubSuccess kesuccess;
+    KismetExternal__MsgbusMessage kemsg;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    kismet_datasource__error_report__init(&keerror);
+    kismet_datasource__sub_success__init(&kesuccess);
+    kismet_external__msgbus_message__init(&kemsg);
 
-    fprintf(stderr, "ERROR: %s\n", msg);
+    kesuccess.success = false;
+    kesuccess.seqno = in_seqno;
 
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
+    kemsg.msgtext = strdup(msg);
+    kemsg.msgtype = MSGFLAG_ERROR;
 
-    kv_pairs[0] = encode_kv_message(msg, MSGFLAG_ERROR);
+    keerror.success = &kesuccess;
+    keerror.message = &kemsg;
 
-    if (kv_pairs[0] == NULL) {
-        free(kv_pairs);
+    uint8_t *buf;
+    size_t len;
+
+    len = kismet_datasource__error_report__get_packed_size(&keerror);
+    buf = (uint8_t *) malloc(len);
+
+    if (buf == NULL) {
+        free(kemsg.msgtext);
         return -1;
     }
 
-    kv_pairs[1] = encode_kv_success(0, 0);
+    kismet_datasource__error_report__pack(&keerror, buf);
 
-    if (kv_pairs[1] == NULL) {
-        free(kv_pairs[0]);
-        free(kv_pairs);
-        return -1;
-    }
+    free(kemsg.msgtext);
 
-    return cf_stream_packet(caph, "ERROR", kv_pairs, 2);
+    return cf_send_packet(caph, "KDSERRORREPORT", buf, len);
 }
 
 int cf_send_listresp(kis_capture_handler_t *caph, uint32_t seq, unsigned int success,
         const char *msg, cf_params_list_interface_t **interfaces, size_t len) {
-    /* How many KV pairs are we allocating?  1 for success for sure */
-    size_t num_kvs = 1;
+    KismetDatasource__InterfacesReport keinterfaces;
+    KismetDatasource__SubSuccess kesuccess;
+    KismetExternal__MsgbusMessage kemsg;
+    KismetDatasource__SubInterface **kesubinterfaces = NULL;
 
-    size_t kv_pos = 0;
-    size_t i = 0;
+    kismet_datasource__interfaces_report__init(&keinterfaces);
+    kismet_datasource__sub_success__init(&kesuccess);
+    kismet_external__msgbus_message__init(&kemsg);
 
-    /* The fields we push for the interface array */
-    const char *interface_fields[] = {
-        "interface",
-        "flags",
-        "hardware"
-    };
-    size_t num_interface_fields = 3;
-    char ***interface_table = NULL;
+    uint8_t *buf;
+    size_t buf_len;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    size_t i;
 
-    if (msg != NULL && strlen(msg) != 0)
-        num_kvs++;
+    bool fault = false;
 
-    if (len != 0)
-        num_kvs++;
+    if (len > 0) {
+        kesubinterfaces = 
+            (KismetDatasource__SubInterface **) malloc(sizeof(KismetDatasource__SubInterface *) * len);
 
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    kv_pairs[kv_pos] = encode_kv_success(success, seq);
-
-    if (kv_pairs[kv_pos] == NULL) {
-        fprintf(stderr, "FATAL: Unable to allocate KV SUCCESS pair\n");
-        free(kv_pairs);
-        return -1;
-    }
-
-    kv_pos++;
-
-    if (msg != NULL && strlen(msg) != 0) {
-        kv_pairs[kv_pos] = 
-            encode_kv_message(msg, success ? MSGFLAG_INFO : MSGFLAG_ERROR);
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV MESSAGE pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
-            return -1;
-        }
-        kv_pos++;
-    }
-
-    if (len != 0) {
-        /* Convert the listed interfaces into a table; we can use the same pointers to
-         * the strings and free the device list itself; this is some extra work but we
-         * only do this once 
-         *
-         * Allocate the length...
-         */
-        interface_table = (char ***) malloc(sizeof(char **) * len);
-
-        if (interface_table == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate interface table for INTERFACES kv pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
+        if (kesubinterfaces == NULL) {
             return -1;
         }
 
         for (i = 0; i < len; i++) {
-            /* Allocate the fields */
-            interface_table[i] = (char **) malloc(sizeof(char *) * num_interface_fields);
+            kesubinterfaces[i] = 
+                (KismetDatasource__SubInterface *) malloc(sizeof(KismetDatasource__SubInterface));
 
-            if (interface_table[i] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate interface table fields for "
-                        "INTERFACES kv pair\n");
-                free(interface_table);
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
+            if (kesubinterfaces[i] == NULL) {
+                fault = true;
+                break;
             }
 
-            /* Use the same pointers as the interface list object */
-            interface_table[i][0] = interfaces[i]->interface;
-            interface_table[i][1] = interfaces[i]->flags;
-            interface_table[i][2] = interfaces[i]->hardware;
+            kismet_datasource__sub_interface__init(kesubinterfaces[i]);
+           
+            /* Use the allocated data; we don't need to free it ourselves */
+            kesubinterfaces[i]->interface = interfaces[i]->interface;
+            kesubinterfaces[i]->flags = interfaces[i]->flags;
+            kesubinterfaces[i]->hardware = interfaces[i]->hardware;
         }
 
-        kv_pairs[kv_pos] =
-            encode_kv_arraylist("INTERFACELIST", interface_fields, num_interface_fields, 
-                    interface_table, len);
+        if (fault) {
+            for (i = 0; i < len; i++) {
+                if (kesubinterfaces[i] == NULL)
+                    break;
 
-        /* We no longer need this since it's now encoded into the response kv */
-        for (i = 0; i < len; i++) 
-            free(interface_table[i]);
-        free(interface_table);
-
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV INTERFACE pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
+                free(kesubinterfaces[i]);
             }
-            free(kv_pairs);
+
+            free(kesubinterfaces);
+
             return -1;
         }
-        kv_pos++;
+
+        keinterfaces.n_interfaces = len;
+        keinterfaces.interfaces = kesubinterfaces;
     }
 
-    return cf_stream_packet(caph, "LISTRESP", kv_pairs, kv_pos);
+    if (msg != NULL) {
+        kemsg.msgtext = strdup(msg);
+
+        if (success)
+            kemsg.msgtype = MSGFLAG_INFO;
+        else
+            kemsg.msgtype = MSGFLAG_ERROR;
+
+        keinterfaces.message = &kemsg;
+    }
+
+    kesuccess.success = success;
+    kesuccess.seqno = seq;
+    keinterfaces.success = &kesuccess;
+
+    buf_len = kismet_datasource__interfaces_report__get_packed_size(&keinterfaces);
+    buf = (uint8_t *) malloc(buf_len);
+
+    if (buf == NULL) {
+        free(kemsg.msgtext);
+        return -1;
+    }
+
+    kismet_datasource__interfaces_report__pack(&keinterfaces, buf);
+
+    if (msg)
+        free(kemsg.msgtext);
+
+    /* We don't need to get rid of the contents of these, they're sharing memory
+     * with the interface report coming in */
+    for (i = 0; i < len; i++) {
+        if (kesubinterfaces[i] == NULL)
+            break;
+
+        free(kesubinterfaces[i]);
+    }
+
+    free(kesubinterfaces);
+
+    return cf_send_packet(caph, "KDSINTERFACESREPORT", buf, buf_len);
 }
 
 int cf_send_proberesp(kis_capture_handler_t *caph, uint32_t seq, 
         unsigned int success, const char *msg, 
         cf_params_interface_t *interface, cf_params_spectrum_t *spectrum) {
-    /* How many KV pairs are we allocating?  1 for success for sure */
-    size_t num_kvs = 1;
 
-    size_t kv_pos = 0;
-    size_t i = 0;
+    KismetDatasource__ProbeSourceReport keprobe;
+    KismetDatasource__SubSuccess kesuccess;
+    KismetExternal__MsgbusMessage kemsg;
+    KismetDatasource__SubChannels kechannels;
+    KismetDatasource__SubChanset kechanset;
+    KismetDatasource__SubSpecset kespecset;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    uint8_t *buf;
+    size_t buf_len;
+    
 
-    if (msg != NULL && strlen(msg) != 0)
-        num_kvs++;
+    kismet_datasource__probe_source_report__init(&keprobe);
+    kismet_datasource__sub_success__init(&kesuccess);
+    kismet_external__msgbus_message__init(&kemsg);
+    kismet_datasource__sub_channels__init(&kechannels);
+    kismet_datasource__sub_chanset__init(&kechanset);
+    kismet_datasource__sub_specset__init(&kespecset);
 
-    if (interface != NULL) {
-        if (interface->chanset != NULL)
-            num_kvs++;
+    /* Always set the success */
+    kesuccess.success = success;
+    kesuccess.seqno = seq;
 
-        if (interface->channels_len != 0)
-            num_kvs++;
-
-        if (interface->hardware != NULL)
-            num_kvs++;
-    }
-
-    if (spectrum != NULL) {
-        num_kvs++;
-    }
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    kv_pairs[kv_pos] = encode_kv_success(success, seq);
-
-    if (kv_pairs[kv_pos] == NULL) {
-        fprintf(stderr, "FATAL: Unable to allocate KV SUCCESS pair\n");
-        free(kv_pairs);
-        return -1;
-    }
-
-    kv_pos++;
-
-    if (msg != NULL && strlen(msg) != 0) {
-        kv_pairs[kv_pos] = 
-            encode_kv_message(msg, success ? MSGFLAG_INFO : MSGFLAG_ERROR);
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV MESSAGE pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
-            return -1;
-        }
-        kv_pos++;
-    }
+    keprobe.success = &kesuccess;
 
     if (interface != NULL) {
         if (interface->chanset != NULL) {
-            kv_pairs[kv_pos] = encode_kv_chanset(interface->chanset);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV CHANSET pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
+            kechanset.channel = interface->chanset;
+            keprobe.channel = &kechanset;
         }
 
         if (interface->channels_len != 0) {
-            kv_pairs[kv_pos] = encode_kv_channels(interface->channels, 
-                    interface->channels_len);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV CHANNELS pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
+            kechannels.n_channels = interface->channels_len;
+            kechannels.channels = interface->channels;
+            keprobe.channels = &kechannels;
         }
 
         if (interface->hardware != NULL) {
-            kv_pairs[kv_pos] = encode_kv_hardware(interface->hardware);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV HARDWARE pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
+            keprobe.hardware = interface->hardware;
+        }
+
+        if (spectrum != NULL) {
+            kespecset.has_start_mhz = true;
+            kespecset.start_mhz = spectrum->start_mhz;
+
+            kespecset.has_end_mhz = true;
+            kespecset.end_mhz = spectrum->end_mhz;
+
+            kespecset.has_samples_per_bucket = true;
+            kespecset.samples_per_bucket = spectrum->samples_per_freq;
+
+            kespecset.has_bucket_width_hz = true;
+            kespecset.bucket_width_hz = spectrum->bin_width;
+
+            kespecset.has_enable_amp = true;
+            kespecset.enable_amp = spectrum->amp;
+
+            kespecset.has_if_amp = true;
+            kespecset.if_amp = spectrum->if_amp;
+
+            kespecset.has_baseband_amp = true;
+            kespecset.baseband_amp = spectrum->baseband_amp;
+
+            keprobe.spectrum = &kespecset;
         }
     }
 
-    if (spectrum != NULL) {
-        kv_pairs[kv_pos] = encode_kv_specset(spectrum->start_mhz, spectrum->end_mhz,
-                spectrum->samples_per_freq, spectrum->bin_width, spectrum->amp,
-                spectrum->if_amp, spectrum->baseband_amp);
+    buf_len = kismet_datasource__probe_source_report__get_packed_size(&keprobe);
+    buf = (uint8_t *) malloc(buf_len);
 
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV SPECSET pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
-            return -1;
-        }
-        kv_pos++;
+    if (buf == NULL) {
+        if (msg)
+            free(kemsg.msgtext);
+        return -1;
     }
 
-    return cf_stream_packet(caph, "PROBERESP", kv_pairs, kv_pos);
+    kismet_datasource__probe_source_report__pack(&keprobe, buf);
+
+    if (msg)
+        free(kemsg.msgtext);
+
+    return cf_send_packet(caph, "KDSPROBESOURCEREPORT", buf, buf_len);
 }
 
 int cf_send_openresp(kis_capture_handler_t *caph, uint32_t seq, unsigned int success,
         const char *msg, uint32_t dlt, const char *uuid, 
         cf_params_interface_t *interface, cf_params_spectrum_t *spectrum) {
-    /* How many KV pairs are we allocating?  2 for success + dlt for sure */
-    size_t num_kvs = 2;
 
-    size_t kv_pos = 0;
-    size_t i = 0;
+    KismetDatasource__OpenSourceReport keopen;
+    KismetDatasource__SubSuccess kesuccess;
+    KismetExternal__MsgbusMessage kemsg;
+    KismetDatasource__SubChannels kechannels;
+    KismetDatasource__SubChanset kechanset;
+    KismetDatasource__SubSpecset kespecset;
+    KismetDatasource__SubChanhop kechanhop;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    uint8_t *buf;
+    size_t buf_len;
+    
 
-    if (msg != NULL && strlen(msg) != 0)
-        num_kvs++;
+    kismet_datasource__open_source_report__init(&keopen);
+    kismet_datasource__sub_success__init(&kesuccess);
+    kismet_external__msgbus_message__init(&kemsg);
+    kismet_datasource__sub_channels__init(&kechannels);
+    kismet_datasource__sub_chanset__init(&kechanset);
+    kismet_datasource__sub_specset__init(&kespecset);
+    kismet_datasource__sub_chanhop__init(&kechanhop);
 
-    if (interface != NULL) {
-        if (interface->chanset != NULL)
-            num_kvs++;
+    /* Always set the success */
+    kesuccess.success = success;
+    kesuccess.seqno = seq;
 
-        if (interface->channels_len != 0)
-            num_kvs++;
-
-        if (interface->capif != NULL)
-            num_kvs++;
-
-        if (interface->hardware != NULL)
-            num_kvs++;
-    }
-
-    if (uuid != NULL)
-        num_kvs++;
-
-    if (spectrum != NULL)
-        num_kvs++;
-
-    /* fprintf(stderr, "debug - openresp going to allocate %u kvs\n", num_kvs); */
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    kv_pairs[kv_pos] = encode_kv_success(success, seq);
-    if (kv_pairs[kv_pos] == NULL) {
-        fprintf(stderr, "FATAL: Unable to allocate KV SUCCESS pair\n");
-        free(kv_pairs);
-        return -1;
-    }
-    kv_pos++;
-
-    kv_pairs[kv_pos] = encode_kv_dlt(dlt);
-    if (kv_pairs[kv_pos] == NULL) {
-        fprintf(stderr, "FATAL: Unable to allocate KV DLT pair\n");
-        for (i = 0; i < kv_pos; i++) {
-            free(kv_pairs[i]);
-        }
-        free(kv_pairs);
-        return -1;
-    }
-    kv_pos++;
-
-
-    if (msg != NULL && strlen(msg) != 0) {
-        kv_pairs[kv_pos] = 
-            encode_kv_message(msg, success ? MSGFLAG_INFO : MSGFLAG_ERROR);
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV MESSAGE pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
-            return -1;
-        }
-        kv_pos++;
-    }
-
-    if (uuid != NULL) {
-        kv_pairs[kv_pos] = encode_kv_uuid(uuid);
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV UUID pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
-            return -1;
-        }
-        kv_pos++;
-    }
+    keopen.success = &kesuccess;
 
     if (interface != NULL) {
-        if (interface->capif != NULL) {
-            kv_pairs[kv_pos] = encode_kv_capif(interface->capif);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV CAPIF pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
-        }
-
-        if (interface->chanset != 0) {
-            kv_pairs[kv_pos] = encode_kv_chanset(interface->chanset);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV CHANSET pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
+        if (interface->chanset != NULL) {
+            kechanset.channel = interface->chanset;
+            keopen.channel = &kechanset;
         }
 
         if (interface->channels_len != 0) {
-            kv_pairs[kv_pos] = encode_kv_channels(interface->channels, 
-                    interface->channels_len);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV CHANNELS pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
+            kechannels.n_channels = interface->channels_len;
+            kechannels.channels = interface->channels;
+            keopen.channels = &kechannels;
+        }
+
+        /* Set the hopping parameters */
+        if (caph->hopping_running > 0) {
+            /* we don't have to copy the hop list we just use the same pointers */
+            kechanhop.channels = caph->channel_hop_list;
+            kechanhop.n_channels = caph->channel_hop_list_sz;
+
+            kechanhop.has_rate = true;
+            kechanhop.rate = caph->channel_hop_rate;
+
+            kechanhop.has_shuffle = true;
+            kechanhop.shuffle = caph->channel_hop_shuffle;
+
+            kechanhop.has_shuffle_skip = true;
+            kechanhop.shuffle_skip = caph->channel_hop_shuffle_spacing;
+
+            kechanhop.has_offset = true;
+            kechanhop.offset = caph->channel_hop_offset;
+
+            keopen.hop_config = &kechanhop;
         }
 
         if (interface->hardware != NULL) {
-            kv_pairs[kv_pos] = encode_kv_hardware(interface->hardware);
-            if (kv_pairs[kv_pos] == NULL) {
-                fprintf(stderr, "FATAL: Unable to allocate KV HARDWARE pair\n");
-                for (i = 0; i < kv_pos; i++) {
-                    free(kv_pairs[i]);
-                }
-                free(kv_pairs);
-                return -1;
-            }
-            kv_pos++;
+            keopen.hardware = interface->hardware;
         }
+
+        if (spectrum != NULL) {
+            kespecset.has_start_mhz = true;
+            kespecset.start_mhz = spectrum->start_mhz;
+
+            kespecset.has_end_mhz = true;
+            kespecset.end_mhz = spectrum->end_mhz;
+
+            kespecset.has_samples_per_bucket = true;
+            kespecset.samples_per_bucket = spectrum->samples_per_freq;
+
+            kespecset.has_bucket_width_hz = true;
+            kespecset.bucket_width_hz = spectrum->bin_width;
+
+            kespecset.has_enable_amp = true;
+            kespecset.enable_amp = spectrum->amp;
+
+            kespecset.has_if_amp = true;
+            kespecset.if_amp = spectrum->if_amp;
+
+            kespecset.has_baseband_amp = true;
+            kespecset.baseband_amp = spectrum->baseband_amp;
+
+            keopen.spectrum = &kespecset;
+        }
+
+        /* Set the capif if we have it */
+        keopen.capture_interface = interface->capif;
     }
 
-    if (spectrum != NULL) {
-        kv_pairs[kv_pos] = encode_kv_specset(spectrum->start_mhz, spectrum->end_mhz,
-                spectrum->samples_per_freq, spectrum->bin_width, spectrum->amp,
-                spectrum->if_amp, spectrum->baseband_amp);
+    /* Always set the dlt */
+    keopen.has_dlt = true;
+    keopen.dlt = dlt;
 
-        if (kv_pairs[kv_pos] == NULL) {
-            fprintf(stderr, "FATAL: Unable to allocate KV SPECSET pair\n");
-            for (i = 0; i < kv_pos; i++) {
-                free(kv_pairs[i]);
-            }
-            free(kv_pairs);
-            return -1;
-        }
-        kv_pos++;
+    /* Set the UUID? */
+    if (uuid != NULL) {
+        keopen.uuid = strdup(uuid);
     }
 
-    return cf_stream_packet(caph, "OPENRESP", kv_pairs, kv_pos);
+    buf_len = kismet_datasource__open_source_report__get_packed_size(&keopen);
+    buf = (uint8_t *) malloc(buf_len);
+
+    if (buf == NULL) {
+        if (msg != NULL)
+            free(kemsg.msgtext);
+        if (uuid != NULL)
+            free(keopen.uuid);
+        return -1;
+    }
+
+    kismet_datasource__open_source_report__pack(&keopen, buf);
+
+    if (msg != NULL)
+        free(kemsg.msgtext);
+    if (uuid != NULL)
+        free(keopen.uuid);
+
+    return cf_send_packet(caph, "KDSOPENSOURCEREPORT", buf, buf_len);
 }
 
 int cf_send_data(kis_capture_handler_t *caph,
-        simple_cap_proto_kv_t *kv_message,
-        simple_cap_proto_kv_t *kv_signal,
-        simple_cap_proto_kv_t *kv_gps,
-        struct timeval ts, uint32_t packet_sz, uint8_t *pack) {
+        KismetExternal__MsgbusMessage *kv_message,
+        KismetDatasource__SubSignal *kv_signal,
+        KismetDatasource__SubGps *kv_gps,
+        struct timeval ts, uint32_t dlt, uint32_t packet_sz, uint8_t *pack) {
 
-    // fprintf(stderr, "debug - cf_send_data starting\n");
+    KismetDatasource__DataReport kedata;
+    KismetDatasource__SubPacket kepkt;
+    KismetDatasource__SubGps kegps;
 
-    /* How many KV pairs are we allocating?  1 for data for sure */
-    size_t num_kvs = 1;
+    kismet_datasource__data_report__init(&kedata);
+    kismet_datasource__sub_packet__init(&kepkt);
+    kismet_datasource__sub_gps__init(&kegps);
 
-    size_t kv_pos = 0;
-    size_t i = 0;
-
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
-
-    if (kv_message != NULL)
-        num_kvs++;
-    if (kv_signal != NULL)
-        num_kvs++;
-    if (kv_gps != NULL)
-        num_kvs++;
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    if (kv_message != NULL) {
-        kv_pairs[kv_pos] = kv_message;
-        kv_pos++;
-    }
-
-    if (kv_signal != NULL) {
-        kv_pairs[kv_pos] = kv_signal;
-        kv_pos++;
-    }
+    kedata.signal = kv_signal;
+    kedata.message = kv_message;
 
     if (kv_gps != NULL) {
-        kv_pairs[kv_pos] = kv_gps;
-        kv_pos++;
+        kedata.gps = kv_gps;
+    } else if (caph->gps_fixed_lat != 0) {
+        struct timeval tv;
+
+        kegps.lat = caph->gps_fixed_lat;
+        kegps.lon = caph->gps_fixed_lon;
+        kegps.alt = caph->gps_fixed_alt;
+        kegps.fix = 3;
+
+        gettimeofday(&tv, NULL);
+        kegps.time_sec = tv.tv_sec;
+        kegps.time_usec = tv.tv_usec;
+
+        kegps.type = strdup("remote-fixed");
+
+        if (caph->gps_name != NULL)
+            kegps.name = strdup(caph->gps_name);
+        else
+            kegps.name = strdup("remote-fixed");
+
+        kedata.gps = &kegps;
     }
 
-    kv_pairs[kv_pos] = encode_kv_capdata(ts, packet_sz, pack);
-    if (kv_pairs[kv_pos] == NULL) {
-        fprintf(stderr, "FATAL: Unable to allocate KV DATA pair\n");
-        for (i = 0; i < kv_pos; i++) {
-            free(kv_pairs[i]);
-        }
-        free(kv_pairs);
+    if (packet_sz > 0 && pack != NULL) {
+        kepkt.time_sec = ts.tv_sec;
+        kepkt.time_usec = ts.tv_usec;
+        kepkt.dlt = dlt;
+        kepkt.size = packet_sz;
+        kepkt.data.len = packet_sz;
+        kepkt.data.data = pack;
+
+        kedata.packet = &kepkt;
+    }
+
+    uint8_t *buf;
+    size_t buf_len;
+
+    buf_len = kismet_datasource__data_report__get_packed_size(&kedata);
+    buf = (uint8_t *) malloc(buf_len);
+
+    if (buf == NULL) {
         return -1;
     }
-    kv_pos++;
 
-    return cf_stream_packet(caph, "DATA", kv_pairs, kv_pos);
+    kismet_datasource__data_report__pack(&kedata, buf);
+
+    if (kegps.name != NULL)
+        free(kegps.name);
+    if (kegps.type != NULL)
+        free(kegps.type);
+
+    return cf_send_packet(caph, "KDSDATAREPORT", buf, buf_len);
 }
+
+int cf_send_json(kis_capture_handler_t *caph,
+        KismetExternal__MsgbusMessage *kv_message,
+        KismetDatasource__SubSignal *kv_signal,
+        KismetDatasource__SubGps *kv_gps,
+        struct timeval ts, char *type, char *json) {
+
+    KismetDatasource__DataReport kedata;
+    KismetDatasource__SubJson kejson;
+    KismetDatasource__SubGps kegps;
+
+    kismet_datasource__data_report__init(&kedata);
+    kismet_datasource__sub_json__init(&kejson);
+    kismet_datasource__sub_gps__init(&kegps);
+
+    kedata.signal = kv_signal;
+    kedata.message = kv_message;
+
+    if (kv_gps != NULL) {
+        kedata.gps = kv_gps;
+    } else if (caph->gps_fixed_lat != 0) {
+        struct timeval tv;
+
+        kegps.lat = caph->gps_fixed_lat;
+        kegps.lon = caph->gps_fixed_lon;
+        kegps.alt = caph->gps_fixed_alt;
+        kegps.fix = 3;
+
+        gettimeofday(&tv, NULL);
+        kegps.time_sec = tv.tv_sec;
+        kegps.time_usec = tv.tv_usec;
+
+        kegps.type = strdup("remote-fixed");
+
+        if (caph->gps_name != NULL)
+            kegps.name = strdup(caph->gps_name);
+        else
+            kegps.name = strdup("remote-fixed");
+
+        kedata.gps = &kegps;
+    }
+
+    if (type != NULL && json  != NULL) {
+        kejson.time_sec = ts.tv_sec;
+        kejson.time_usec = ts.tv_usec;
+        kejson.type = type;
+        kejson.json = json;
+
+        kedata.json = &kejson;
+    }
+
+    uint8_t *buf;
+    size_t buf_len;
+
+    buf_len = kismet_datasource__data_report__get_packed_size(&kedata);
+    buf = (uint8_t *) malloc(buf_len);
+
+    if (buf == NULL) {
+        return -1;
+    }
+
+    kismet_datasource__data_report__pack(&kedata, buf);
+
+    if (kegps.name != NULL)
+        free(kegps.name);
+    if (kegps.type != NULL)
+        free(kegps.type);
+
+    return cf_send_packet(caph, "KDSDATAREPORT", buf, buf_len);
+}
+
 
 int cf_send_configresp(kis_capture_handler_t *caph, unsigned int seqno, 
-        unsigned int success, const char *msg) {
-    size_t num_kvs = 1;
-    size_t kv_pos = 0;
-    size_t kvi;
+        unsigned int success, const char *msg, const char *warning) {
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    KismetDatasource__ConfigureReport keconf;
+    KismetDatasource__SubSuccess kesuccess;
+    KismetExternal__MsgbusMessage kemsg;
+    KismetDatasource__SubChanset kechanset;
+    KismetDatasource__SubChanhop kechanhop;
 
-    if (msg != NULL && strlen(msg) != 0)
-        num_kvs++;
+    uint8_t *buf;
+    size_t buf_len;
+    
 
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
+    kismet_datasource__configure_report__init(&keconf);
+    kismet_datasource__sub_success__init(&kesuccess);
+    kismet_external__msgbus_message__init(&kemsg);
+    kismet_datasource__sub_chanset__init(&kechanset);
+    kismet_datasource__sub_chanhop__init(&kechanhop);
 
-    if (msg != NULL && strlen(msg) != 0) {
-        kv_pairs[kv_pos] = encode_kv_message(msg, 
-                success ? MSGFLAG_INFO : MSGFLAG_ERROR);
+    /* Always set the success */
+    kesuccess.success = success;
+    kesuccess.seqno = seqno;
 
-        if (kv_pairs[kv_pos] == NULL) {
-            free(kv_pairs);
-            return -1;
-        }
+    keconf.success = &kesuccess;
 
-        kv_pos++;
+    /* If we're not hopping, set the single channel response */
+    if (!caph->hopping_running && caph->channel != NULL) {
+        /* Set the single channel */
+        kechanset.channel = caph->channel;
+        keconf.channel = &kechanset;
     }
 
-    kv_pairs[kv_pos] = encode_kv_success(success, seqno);
+    /* Set the hopping parameters */
+    /* we don't have to copy the hop list we just use the same pointers */
+    kechanhop.channels = caph->channel_hop_list;
+    kechanhop.n_channels = caph->channel_hop_list_sz;
 
-    if (kv_pairs[kv_pos] == NULL) {
-        for (kvi = 0; kvi < kv_pos; kvi++) 
-            free(kv_pairs[kvi]);
-        free(kv_pairs);
+    kechanhop.has_rate = true;
+    kechanhop.rate = caph->channel_hop_rate;
+
+    kechanhop.has_shuffle = true;
+    kechanhop.shuffle = caph->channel_hop_shuffle;
+
+    kechanhop.has_shuffle_skip = true;
+    kechanhop.shuffle_skip = caph->channel_hop_shuffle_spacing;
+
+    kechanhop.has_offset = true;
+    kechanhop.offset = caph->channel_hop_offset;
+
+    keconf.hopping = &kechanhop;
+
+    buf_len = kismet_datasource__configure_report__get_packed_size(&keconf);
+    buf = (uint8_t *) malloc(buf_len);
+
+    if (buf == NULL) {
+        if (msg)
+            free(kemsg.msgtext);
         return -1;
     }
 
-    return cf_stream_packet(caph, "CONFIGRESP", kv_pairs, num_kvs);
-}
+    kismet_datasource__configure_report__pack(&keconf, buf);
 
-int cf_send_configresp_channel(kis_capture_handler_t *caph, unsigned int seqno, 
-        unsigned int success, const char *msg, const char *channel) {
-    size_t num_kvs = 1;
-    size_t kv_pos = 0;
-    size_t kvi;
+    if (msg)
+        free(kemsg.msgtext);
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
-
-    if (msg != NULL && strlen(msg) != 0)
-        num_kvs++;
-
-    if (channel != NULL)
-        num_kvs++;
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    if (msg != NULL && strlen(msg) != 0) {
-        kv_pairs[kv_pos] = encode_kv_message(msg, 
-                success ? MSGFLAG_INFO : MSGFLAG_ERROR);
-
-        if (kv_pairs[kv_pos] == NULL) {
-            free(kv_pairs);
-            return -1;
-        }
-
-        kv_pos++;
-    }
-
-    if (channel != NULL) {
-        kv_pairs[kv_pos] = encode_kv_channel(channel);
-
-        if (kv_pairs[kv_pos] == NULL) {
-            for (kvi = 0; kvi < kv_pos; kvi++) 
-                free(kv_pairs[kvi]);
-            free(kv_pairs);
-            return -1;
-        }
-
-        kv_pos++;
-    }
-
-    kv_pairs[kv_pos] = encode_kv_success(success, seqno);
-
-    if (kv_pairs[kv_pos] == NULL) {
-        for (kvi = 0; kvi < kv_pos; kvi++) 
-            free(kv_pairs[kvi]);
-        free(kv_pairs);
-        return -1;
-    }
-
-    return cf_stream_packet(caph, "CONFIGRESP", kv_pairs, num_kvs);
-}
-
-int cf_send_configresp_chanhop(kis_capture_handler_t *caph, unsigned int seqno, 
-        unsigned int success, const char *msg, double hop_rate,
-        char **channel_list, size_t channel_list_sz) {
-    size_t num_kvs = 1;
-    size_t kv_pos = 0;
-    size_t kvi;
-
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
-
-    if (msg != NULL && strlen(msg) != 0)
-        num_kvs++;
-
-    if (channel_list_sz != 0)
-        num_kvs++;
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    if (msg != NULL && strlen(msg) != 0) {
-        kv_pairs[kv_pos] = encode_kv_message(msg, 
-                success ? MSGFLAG_INFO : MSGFLAG_ERROR);
-
-        if (kv_pairs[kv_pos] == NULL) {
-            free(kv_pairs);
-            return -1;
-        }
-
-        kv_pos++;
-    }
-
-    if (channel_list_sz != 0) {
-        kv_pairs[kv_pos] = encode_kv_chanhop_complex(hop_rate, channel_list, 
-                channel_list_sz, caph->channel_hop_shuffle, 
-                caph->channel_hop_shuffle_spacing, caph->channel_hop_offset);
-
-        if (kv_pairs[kv_pos] == NULL) {
-            for (kvi = 0; kvi < kv_pos; kvi++) 
-                free(kv_pairs[kvi]);
-            free(kv_pairs);
-            return -1;
-        }
-
-        kv_pos++;
-    }
-
-    kv_pairs[kv_pos] = encode_kv_success(success, seqno);
-
-    if (kv_pairs[kv_pos] == NULL) {
-        for (kvi = 0; kvi < kv_pos; kvi++) 
-            free(kv_pairs[kvi]);
-        free(kv_pairs);
-        return -1;
-    }
-
-    kv_pos++;
-
-    return cf_stream_packet(caph, "CONFIGRESP", kv_pairs, num_kvs);
-}
-
-int cf_send_ping(kis_capture_handler_t *caph) {
-    return cf_stream_packet(caph, "PING", NULL, 0);
-}
-
-int cf_send_pong(kis_capture_handler_t *caph) {
-    return cf_stream_packet(caph, "PONG", NULL, 0);
+    return cf_send_packet(caph, "KDSCONFIGUREREPORT", buf, buf_len);
 }
 
 int cf_send_newsource(kis_capture_handler_t *caph, const char *uuid) {
-    size_t num_kvs = 3;
-    size_t kv_pos = 0;
+    KismetDatasource__NewSource kesrc;
 
-    /* Actual KV pairs we encode into the packet */
-    simple_cap_proto_kv_t **kv_pairs;
+    uint8_t *buf;
+    size_t buf_len;
+    
 
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
+    kismet_datasource__new_source__init(&kesrc);
 
-    kv_pairs[kv_pos] = encode_kv_definition(caph->cli_sourcedef);
-    if (kv_pairs[kv_pos] == NULL) {
-        free(kv_pairs);
+    kesrc.definition = caph->cli_sourcedef;
+    kesrc.sourcetype = caph->capsource_type;
+    if (uuid != NULL)
+        kesrc.uuid = strdup(uuid);
+
+    buf_len = kismet_datasource__new_source__get_packed_size(&kesrc);
+    buf = (uint8_t *) malloc(buf_len);
+
+    if (buf == NULL) {
+        if (uuid != NULL)
+            free(kesrc.uuid);
         return -1;
     }
-    kv_pos++;
 
-    kv_pairs[kv_pos] = encode_kv_sourcetype(caph->capsource_type);
-    if (kv_pairs[kv_pos] == NULL) {
-        free(kv_pairs[0]);
-        free(kv_pairs);
-        return -1;
-    }
-    kv_pos++;
+    kismet_datasource__new_source__pack(&kesrc, buf);
 
-    kv_pairs[kv_pos] = encode_kv_uuid(uuid);
-    if (kv_pairs[kv_pos] == NULL) {
-        free(kv_pairs[0]);
-        free(kv_pairs[1]);
-        free(kv_pairs);
-        return -1;
-    }
-    kv_pos++;
+    if (uuid != NULL)
+        free(kesrc.uuid);
 
-    return cf_stream_packet(caph, "NEWSOURCE", kv_pairs, num_kvs);
+    return cf_send_packet(caph, "KDSNEWSOURCE", buf, buf_len);
+}
+
+int cf_send_pong(kis_capture_handler_t *caph, uint32_t in_seqno) {
+    KismetExternal__Pong pong;
+
+    uint8_t *buf;
+    size_t buf_len;
+    
+
+    kismet_external__pong__init(&pong);
+    pong.ping_seqno = in_seqno;
+
+    buf_len = kismet_external__pong__get_packed_size(&pong);
+    buf = (uint8_t *) malloc(buf_len);
+
+    kismet_external__pong__pack(&pong, buf);
+
+    return cf_send_packet(caph, "PONG", buf, buf_len);
 }
 
 double cf_parse_frequency(const char *freq) {
@@ -2858,8 +2950,10 @@ double cf_parse_frequency(const char *freq) {
         return 0;
 
     /* Make a buffer at least as big as the total string to hold the frequency component */
-    ufreq = (char *) malloc(strlen(freq));
+    ufreq = (char *) malloc(strlen(freq) + 1);
 
+    /* sscanf w/ unbounded string component is still 'safe' here because ufreq is the length
+     * of the entire field, so must be able to fit any sub-component of the field.  */
     i = sscanf(freq, "%lf%s", &v, ufreq);
 
     if (i == 1 || strlen(ufreq) == 0) {
@@ -2890,6 +2984,10 @@ int cf_drop_most_caps(kis_capture_handler_t *caph) {
      *
      */
 
+    /* Can't drop caps unless running as root so don't try */
+    if (getuid() != 0)
+        return 0;
+
     char errstr[STATUS_MAX];
 #ifdef HAVE_CAPABILITY
 	cap_value_t cap_list[2] = { CAP_NET_ADMIN, CAP_NET_RAW };
@@ -2899,7 +2997,7 @@ int cf_drop_most_caps(kis_capture_handler_t *caph) {
 	if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == -1) {
         snprintf(errstr, STATUS_MAX, "datasource failed to set keepcaps in prctl: %s",
                 strerror(errno));
-        cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
+        cf_send_warning(caph, errstr);
         cap_free(caps);
         return -1;
 	}
@@ -2910,7 +3008,7 @@ int cf_drop_most_caps(kis_capture_handler_t *caph) {
 	if (cap_set_proc(caps)) {
         snprintf(errstr, STATUS_MAX, "datasource failed to set future process "
                 "capabilities: %s", strerror(errno));
-        cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
+        cf_send_warning(caph, errstr);
         cap_free(caps);
         return -1;
 	}
@@ -2919,7 +3017,7 @@ int cf_drop_most_caps(kis_capture_handler_t *caph) {
 	if (cap_set_proc(caps)) {
         snprintf(errstr, STATUS_MAX, "datasource failed to set effective capabilities: %s",
                 strerror(errno));
-        cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
+        cf_send_warning(caph, errstr);
         cap_free(caps);
         return -1;
     }
@@ -2929,7 +3027,7 @@ int cf_drop_most_caps(kis_capture_handler_t *caph) {
     return 1;
 #else
     snprintf(errstr, STATUS_MAX, "datasource not compiled with libcap capabilities control");
-    cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
+    cf_send_warning(caph, errstr);
     return 0;
 #endif
 }
@@ -2938,27 +3036,43 @@ int cf_jail_filesystem(kis_capture_handler_t *caph) {
     char errstr[STATUS_MAX];
 #ifdef SYS_LINUX
 
+    /* Can't jail filesystem if not running as root */
+    if (getuid() != 0)
+        return 0;
+
     /* Eject ourselves from the namespace into a new temporary one */
     if (unshare(CLONE_NEWNS) < 0) {
-        snprintf(errstr, STATUS_MAX, "datasource failed to jail to new namespace: %s",
-                strerror(errno));
-        cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
-        return -1;
+        /* Only send warning if we're running as root */
+        if (getuid() == 0) {
+            snprintf(errstr, STATUS_MAX, "datasource failed to jail to new namespace: %s",
+                    strerror(errno));
+            cf_send_warning(caph, errstr);
+            return -1;
+        }
+
+        return 0;
     }
 
     /* Remount / as a read-only bind-mount of itself over our rootfs */
     if (mount("/", "/", "bind", MS_BIND | MS_REMOUNT | MS_PRIVATE | 
                 MS_REC | MS_RDONLY, NULL) < 0) {
-        snprintf(errstr, STATUS_MAX, "datasource failed to remount root in jail as RO: %s",
-                strerror(errno));
-        cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
-        return -1;
+        /* Only send warning if we're running as root */
+        if (getuid() == 0) {
+            snprintf(errstr, STATUS_MAX, "datasource failed to remount root in jail as RO: %s",
+                    strerror(errno));
+            cf_send_warning(caph, errstr);
+            return -1;
+        }
+
+        return 0;
     }
 
     return 1;
 #else
+    /*
     snprintf(errstr, STATUS_MAX, "datasource framework can only jail namespaces on Linux");
-    cf_send_warning(caph, errstr, MSGFLAG_ERROR, errstr);
+    cf_send_warning(caph, errstr);
+    */
     return 0;
 #endif
 }
@@ -3004,7 +3118,11 @@ void cf_handler_remote_capture(kis_capture_handler_t *caph) {
             }
         } else {
             /* Initiate a TCP connection, fail if we can't establish it */
-            if (cf_handler_remote_connect(caph) < 1) {
+            if (caph->reverse_server) {
+                if (cf_handler_remote_server(caph) < 1) {
+                    exit(1);
+                } 
+            } else if (cf_handler_remote_connect(caph) < 1) {
                 exit(1);
             }
 

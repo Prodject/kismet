@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -31,10 +31,10 @@
 // Accept GPS location from HTTP POST, allows using a phone browser as a
 // GPS source
 
-class GPSWeb : public KisGps, public Kis_Net_Httpd_CPPStream_Handler {
+class kis_gps_web : public kis_gps, public kis_net_httpd_cppstream_handler {
 public:
-    GPSWeb(GlobalRegistry *in_globalreg, SharedGpsBuilder in_builder);
-    virtual ~GPSWeb();
+    kis_gps_web(shared_gps_builder in_builder);
+    virtual ~kis_gps_web();
 
     virtual bool open_gps(std::string in_opts);
 
@@ -42,14 +42,14 @@ public:
     virtual bool get_device_connected();
 
     // HTTP api
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
+    virtual bool httpd_verify_path(const char *path, const char *method);
 
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+    virtual void httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
             size_t *upload_data_size, std::stringstream &stream);
 
-    virtual int Httpd_PostIterator(void *coninfo_cls, enum MHD_ValueKind kind, 
+    virtual int httpd_post_iterator(void *coninfo_cls, enum MHD_ValueKind kind, 
             const char *key, const char *filename, const char *content_type,
             const char *transfer_encoding, const char *data, 
             uint64_t off, size_t size);
@@ -60,13 +60,14 @@ protected:
     time_t last_heading_time;
 };
 
-class GPSWebBuilder : public KisGpsBuilder {
+class gps_web_builder : public kis_gps_builder {
 public:
-    GPSWebBuilder(GlobalRegistry *in_globalreg) : KisGpsBuilder(in_globalreg, 0) { 
+    gps_web_builder() : 
+        kis_gps_builder() { 
         initialize();
     }
 
-    virtual void initialize() {
+    virtual void initialize() override {
         set_int_gps_class("web");
         set_int_gps_class_description("Web-based GPS using client browser");
         set_int_gps_priority(0);
@@ -74,8 +75,8 @@ public:
         set_int_singleton(true);
     }
 
-    virtual SharedGps build_gps(SharedGpsBuilder in_builder) {
-        return SharedGps(new GPSWeb(globalreg, in_builder));
+    virtual shared_gps build_gps(shared_gps_builder in_builder) override {
+        return shared_gps(new kis_gps_web(in_builder));
     }
 };
 

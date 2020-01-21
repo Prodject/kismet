@@ -34,30 +34,7 @@
 /* https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/device-api.txt */
 
 /* Bluetooth devices are sent as complete device records in a custom
- * capsource packet:
- *
- * LINUXBTDEVICE
- * A complete bluetooth device record as reported over the dbus channel
- *
- * KV Pairs:
- * GPS (optional)
- * SIGNAL 
- * BTDEVICE
- *
- * KV BTDEVICE
- * Bluetooth device record KV.
- *
- * Content:
- *
- * Msgpack packed dictionary containing the following:
- * "address": (string) String mac address of the device
- * "name": (string) String name of the device, as advertised (optional)
- * "uuid_vec": Vetor of string UUIDs (optional)
- * "tv_sec": (uint64_t) Unix timestamp second component
- * "tv_usec": (uint64_t) Unix timestamp microsecond component
- * "txpower": (int) Transmit power, if advertised (optional)
- * "addrtype": (uint) Address type
- *
+ * capsource packet, using the bluetooth protobuf entry
  */
 
 #include "../config.h"
@@ -79,9 +56,10 @@
 
 #include "linux_bt_rfkill.h"
 
-#include "../simple_datasource_proto.h"
 #include "../simple_ringbuf_c.h"
 #include "../capture_framework.h"
+
+#include "../protobuf_c/linuxbluetooth.pb-c.h"
 
 /* Unique instance data passed around by capframework */
 typedef struct {
@@ -124,156 +102,53 @@ static char *eir_get_name(const uint8_t *eir, uint16_t eir_len);
 static unsigned int eir_get_flags(const uint8_t *eir, uint16_t eir_len);
 void bdaddr_to_string(const uint8_t *bdaddr, char *str);
 
-/* Encode a BTDEVICE KV pair */
-simple_cap_proto_kv_t *encode_kv_btdevice(struct mgmt_ev_device_found *dev) {
-    const char *key_address = "address";
-    const char *key_name = "name";
-    const char *key_uuid_vec = "uuid_vec";
-    const char *key_tv_sec = "tv_sec";
-    const char *key_tv_usec = "tv_usec";
-    const char *key_txpower = "txpower";
-    const char *key_type = "type";
-
-    char address[BDADDR_STR_LEN];
-    char *name;
-
-    uint16_t eirlen;
-
-    simple_cap_proto_kv_t *kv;
-    size_t content_sz;
+int cf_send_btdevice(local_bluetooth_t *localbt, struct mgmt_ev_device_found *dev) {
+    KismetLinuxBluetooth__LinuxBluetoothDataReport kereport;
+    KismetLinuxBluetooth__SubLinuxBluetoothDevice kebtdev;
 
     struct timeval tv;
+    char address[BDADDR_STR_LEN];
+    char *name;
+    uint16_t eirlen;
 
-    /* Address, 2 time fields, type are always sent */
-    size_t num_fields = 4;
+    uint8_t *buf;
+    size_t len;
+
+    kismet_linux_bluetooth__linux_bluetooth_data_report__init(&kereport);
+    kismet_linux_bluetooth__sub_linux_bluetooth_device__init(&kebtdev);
+
+    gettimeofday(&tv, NULL);
+
+    /* Convert the address */
+    bdaddr_to_string(dev->addr.bdaddr.b, address);
 
     /* Extract the name from EIR */
     eirlen = le16toh(dev->eir_len);
     name = eir_get_name(dev->eir, eirlen);
 
-    bdaddr_to_string(dev->addr.bdaddr.b, address);
+    kebtdev.time_sec = tv.tv_sec;
+    kebtdev.time_usec = tv.tv_usec;
+    kebtdev.address = address;
+    kebtdev.name = name;
+    kebtdev.type = dev->addr.type;
 
-    if (name != NULL)
-        num_fields++;
+    /* We don't get txpower or uuids currently */
 
-    /* We don't get these, yet, from the mgmtsock */
-    /*
-    if (g_dbus_proxy_get_property(proxy, "UUIDs", &iter))
-        num_fields++;
+    kereport.btdevice = &kebtdev;
 
-    if (g_dbus_proxy_get_property(proxy, "TxPower", &iter))
-        num_fields++;
-    */
+    /* TODO get a GPS function from capframework and fill it in here */
 
-    msgpuck_buffer_t *puckbuffer;
 
-    size_t initial_sz = num_fields * 32;
+    len = kismet_linux_bluetooth__linux_bluetooth_data_report__get_packed_size(&kereport);
+    buf = (uint8_t *) malloc(len);
 
-    puckbuffer = mp_b_create_buffer(initial_sz);
-
-    if (puckbuffer == NULL)
-        return NULL;
-
-    mp_b_encode_map(puckbuffer, num_fields);
-
-    /* Always encode address and timestamp */
-    mp_b_encode_str(puckbuffer, key_address, strlen(key_address));
-    mp_b_encode_str(puckbuffer, address, strlen(address));
-
-    gettimeofday(&tv, NULL);
-
-    mp_b_encode_str(puckbuffer, key_tv_sec, strlen(key_tv_sec));
-    mp_b_encode_uint(puckbuffer, tv.tv_sec);
-
-    mp_b_encode_str(puckbuffer, key_tv_usec, strlen(key_tv_usec));
-    mp_b_encode_uint(puckbuffer, tv.tv_usec);
-
-    mp_b_encode_str(puckbuffer, key_type, strlen(key_type));
-    mp_b_encode_uint(puckbuffer, dev->addr.type);
-
-    if (name != NULL) {
-        mp_b_encode_str(puckbuffer, key_name, strlen(key_name));
-        mp_b_encode_str(puckbuffer, name, strlen(name));
-        free(name);
-    }
-
-    /*
-    if (g_dbus_proxy_get_property(proxy, "TxPower", &iter)) {
-        dbus_message_iter_get_basic(&iter, &txpower);
-
-        mp_b_encode_str(puckbuffer, key_txpower, strlen(key_txpower));
-        mp_b_encode_int(puckbuffer, txpower);
-    }
-
-    if (g_dbus_proxy_get_property(proxy, "UUIDs", &iter)) {
-        int uuid_sz = 0;
-
-        dbus_message_iter_recurse(&iter, &value);
-        while (dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRING) {
-            uuid_sz++;
-            dbus_message_iter_next(&value);
-        }
-
-        if (uuid_sz > 0) {
-            mp_b_encode_str(puckbuffer, key_uuid_vec, strlen(key_uuid_vec));
-            mp_b_encode_array(puckbuffer, uuid_sz);
-
-            dbus_message_iter_recurse(&iter, &value);
-            while (dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_STRING) {
-                const char *uuid;
-
-                dbus_message_iter_get_basic(&value, &uuid);
-
-                mp_b_encode_str(puckbuffer, uuid, strlen(uuid));
-
-                dbus_message_iter_next(&value);
-            }
-        }
-    }
-    */
-
-    content_sz = mp_b_used_buffer(puckbuffer);
-
-    kv = (simple_cap_proto_kv_t *) malloc(sizeof(simple_cap_proto_kv_t) + content_sz);
-
-    if (kv == NULL) {
-        mp_b_free_buffer(puckbuffer);
-        return NULL;
-    }
-
-    snprintf(kv->header.key, 16, "%.16s", "BTDEVICE");
-    kv->header.obj_sz = htonl(content_sz);
-
-    memcpy(kv->object, mp_b_get_buffer(puckbuffer), content_sz);
-
-    mp_b_free_buffer(puckbuffer);
-
-    return kv;
-}
-
-int cf_send_btdevice(local_bluetooth_t *localbt, struct mgmt_ev_device_found *dev) {
-    size_t num_kvs = 2;
-
-    simple_cap_proto_kv_t **kv_pairs;
-
-    kv_pairs = 
-        (simple_cap_proto_kv_t **) malloc(sizeof(simple_cap_proto_kv_t *) * num_kvs);
-
-    kv_pairs[0] = encode_kv_btdevice(dev);
-    
-    if (kv_pairs[0] == NULL) {
-        free(kv_pairs);
+    if (buf == NULL) {
         return -1;
     }
 
-    kv_pairs[1] = encode_kv_signal(dev->rssi, 0, 0, 0, 0.0f, NULL, 0.0f);
-    if (kv_pairs[1] == NULL) {
-        free(kv_pairs[0]);
-        free(kv_pairs);
-        return -1;
-    }
+    kismet_linux_bluetooth__linux_bluetooth_data_report__pack(&kereport, buf);
 
-    return cf_stream_packet(localbt->caph, "LINUXBTDEVICE", kv_pairs, 2);
+    return cf_send_packet(localbt->caph, "LBTDATAREPORT", buf, len);
 }
 
 void bdaddr_to_string(const uint8_t *bdaddr, char *str) {
@@ -447,7 +322,7 @@ void resp_controller_power(local_bluetooth_t *localbt, uint8_t status, uint16_t 
     } else {
         snprintf(errstr, STATUS_MAX, "Interface %s failed to power on",
                 localbt->bt_interface);
-        cf_send_error(localbt->caph, errstr);
+        cf_send_error(localbt->caph, 0, errstr);
         return;
     }
 }
@@ -466,13 +341,13 @@ void evt_controller_discovering(local_bluetooth_t *localbt, uint16_t len, const 
 }
 
 static char *eir_get_name(const uint8_t *eir, uint16_t eir_len) {
-    uint8_t parsed = 0;
+    uint16_t parsed = 0;
 
     if (eir_len < 2)
         return NULL;
 
     while (parsed < eir_len - 1) {
-        uint8_t field_len = eir[0];
+        uint16_t field_len = eir[0];
 
         if (field_len == 0)
             break;
@@ -606,14 +481,14 @@ void handle_mgmt_response(local_bluetooth_t *localbt) {
                     } else if (crec->status != 0) {
                         snprintf(errstr, STATUS_MAX, 
                                 "Bluetooth interface hci%u discovery failed", rindex);
-                        cf_send_error(localbt->caph, errstr);
+                        cf_send_error(localbt->caph, 0, errstr);
                     }
                     break;
                 case MGMT_OP_SET_BREDR:
                     if (crec->status != 0) {
                         snprintf(errstr, STATUS_MAX, 
                                 "Bluetooth interface hci%u enabling BREDR failed", rindex);
-                        cf_send_error(localbt->caph, errstr);
+                        cf_send_error(localbt->caph, 0, errstr);
                     }
 
                     cmd_get_controller_info(localbt);
@@ -622,7 +497,7 @@ void handle_mgmt_response(local_bluetooth_t *localbt) {
                     if (crec->status != 0) {
                         snprintf(errstr, STATUS_MAX, 
                                 "Bluetooth interface hci%u enabling LE failed", rindex);
-                        cf_send_error(localbt->caph, errstr);
+                        cf_send_error(localbt->caph, 0, errstr);
                     }
 
                     cmd_get_controller_info(localbt);
@@ -649,7 +524,7 @@ void handle_mgmt_response(local_bluetooth_t *localbt) {
                      * device got removed */
                     snprintf(errstr, STATUS_MAX, 
                             "Bluetooth interface hci%u was removed", rindex);
-                    cf_send_error(localbt->caph, errstr);
+                    cf_send_error(localbt->caph, 0, errstr);
                     break;
 
                 default:
@@ -664,7 +539,7 @@ void handle_mgmt_response(local_bluetooth_t *localbt) {
 
 
 int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
-        char *msg, char **uuid, simple_cap_proto_frame_t *frame,
+        char *msg, char **uuid, KismetExternal__Command *frame,
         cf_params_interface_t **ret_interface,
         cf_params_spectrum_t **ret_spectrum) {
     
@@ -716,12 +591,17 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* Make a spoofed, but consistent, UUID based on the adler32 of the interface name 
      * and the mac address of the device */
-    snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
-            adler32_csum((unsigned char *) "kismet_cap_linux_bluetooth", 
-                strlen("kismet_cap_linux_bluetooth")) & 0xFFFFFFFF,
-            hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
-            hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
-    *uuid = strdup(errstr);
+    if ((placeholder_len = cf_find_flag(&placeholder, "uuid", definition)) > 0) {
+        *uuid = strdup(placeholder);
+    } else {
+        snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
+                adler32_csum((unsigned char *) "kismet_cap_linux_bluetooth", 
+                    strlen("kismet_cap_linux_bluetooth")) & 0xFFFFFFFF,
+                hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
+                hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
+        *uuid = strdup(errstr);
+    }
+
     return 1;
 }
 
@@ -794,7 +674,7 @@ int list_callback(kis_capture_handler_t *caph, uint32_t seqno,
 }
 
 int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
-        char *msg, uint32_t *dlt, char **uuid, simple_cap_proto_frame_t *frame,
+        char *msg, uint32_t *dlt, char **uuid, KismetExternal__Command *frame,
         cf_params_interface_t **ret_interface,
         cf_params_spectrum_t **ret_spectrum) {
 
@@ -859,12 +739,16 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
 
     /* Make a spoofed, but consistent, UUID based on the adler32 of the interface name 
      * and the mac address of the device */
-    snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
-            adler32_csum((unsigned char *) "kismet_cap_linux_bluetooth", 
-                strlen("kismet_cap_linux_bluetooth")) & 0xFFFFFFFF,
-            hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
-            hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
-    *uuid = strdup(errstr);
+    if ((placeholder_len = cf_find_flag(&placeholder, "uuid", definition)) > 0) {
+        *uuid = strdup(placeholder);
+    } else {
+        snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
+                adler32_csum((unsigned char *) "kismet_cap_linux_bluetooth", 
+                    strlen("kismet_cap_linux_bluetooth")) & 0xFFFFFFFF,
+                hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
+                hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
+        *uuid = strdup(errstr);
+    }
 
     snprintf(textaddr, 18, "%2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X",
             di.bdaddr.b[5], di.bdaddr.b[4], di.bdaddr.b[3],
@@ -969,7 +853,7 @@ void capture_thread(kis_capture_handler_t *caph) {
                     if (errno != EINTR && errno != EAGAIN) {
                         snprintf(errstr, STATUS_MAX, "Failed to read from "
                                 "management socket: %s", strerror(errno));
-                        cf_send_error(caph, errstr);
+                        cf_send_error(caph, 0, errstr);
                         break;
                     } else {
                         break;
@@ -980,7 +864,7 @@ void capture_thread(kis_capture_handler_t *caph) {
 
                 if ((ssize_t) amt_buffered != amt_read) {
                     snprintf(errstr, STATUS_MAX, "Failed to put management data into buffer");
-                    cf_send_error(caph, errstr);
+                    cf_send_error(caph, 0, errstr);
                     break;
                 }
 
@@ -1026,24 +910,19 @@ int main(int argc, char *argv[]) {
     /* Set the capture thread */
     cf_handler_set_capture_cb(caph, capture_thread);
 
-    /* Support remote capture by launching the remote loop */
-    cf_handler_remote_capture(caph);
-
     if (cf_handler_parse_opts(caph, argc, argv) < 1) {
         cf_print_help(caph, argv[0]);
         return -1;
     }
 
+    /* Support remote capture by launching the remote loop */
+    cf_handler_remote_capture(caph);
 
     /* Jail our ns */
-    if (cf_jail_filesystem(caph) < 1) {
-        fprintf(stderr, "DEBUG - Couldn't jail filesystem\n");
-    }
+    cf_jail_filesystem(caph);
 
     /* Strip our privs */
-    if (cf_drop_most_caps(caph) < 1) {
-        fprintf(stderr, "DEBUG - Didn't drop some privs\n");
-    }
+    cf_drop_most_caps(caph);
 
     cf_handler_loop(caph);
 

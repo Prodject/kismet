@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -30,39 +30,46 @@
 #include "messagebus.h"
 #include "pollabletracker.h"
 
-TcpClientV2::TcpClientV2(GlobalRegistry *in_globalreg, 
-        BufferHandlerGeneric *in_rbhandler) {
-    globalreg = in_globalreg;
-    handler = in_rbhandler;
+tcp_client_v2::tcp_client_v2(global_registry *in_globalreg, 
+        std::shared_ptr<buffer_handler_generic> in_rbhandler) :
+    globalreg {Globalreg::globalreg},
+    handler {in_rbhandler},
+    tcp_mutex {in_rbhandler->get_mutex()} ,
+    pending_connect {false}, 
+    connected {false}, 
+    cli_fd {-1} { }
 
-    cli_fd = -1;
-    connected = false;
-    pending_connect = false;
+tcp_client_v2::~tcp_client_v2() {
+    disconnect();
 }
 
-TcpClientV2::~TcpClientV2() {
-    Disconnect();
-    std::shared_ptr<PollableTracker> pollabletracker =
-        std::static_pointer_cast<PollableTracker>(globalreg->FetchGlobal("POLLABLETRACKER"));
+void tcp_client_v2::set_mutex(std::shared_ptr<kis_recursive_timed_mutex> in_parent) {
+    local_locker l(tcp_mutex);
+
+    if (in_parent != nullptr)
+        tcp_mutex = in_parent;
+    else
+        tcp_mutex = std::make_shared<kis_recursive_timed_mutex>();
 }
 
-int TcpClientV2::Connect(std::string in_host, unsigned int in_port) {
+int tcp_client_v2::connect(std::string in_host, unsigned int in_port) {
+    local_locker l(tcp_mutex);
+
     std::stringstream msg;
 
     if (connected) {
-        msg << "TCP client asked to connect to " << in_host << ":" <<
-            in_port << " but already connected to " << host << ":" << port;
-        _MSG(msg.str(), MSGFLAG_ERROR);
-
+        _MSG_ERROR("TCP client asked to connect to {}:{} but is already connected "
+                "to {}:{}", in_host, in_port, host, port);
         return -1;
     }
 
     if ((client_host = gethostbyname(in_host.c_str())) == NULL) {
-        msg << "TCP client could not resolve host \"" << in_host << "\"";
-        _MSG(msg.str(), MSGFLAG_ERROR);
-
+        _MSG_ERROR("Could not resolve hostname {}", in_host);
         return -1;
     }
+
+    host = in_host;
+    port = in_port;
 
     // Don't handle connecting to all possible IPs a name can resolve to.
     // We may need to revisit this in the future if we're going to connect
@@ -75,24 +82,9 @@ int TcpClientV2::Connect(std::string in_host, unsigned int in_port) {
             client_host->h_length);
     client_sock.sin_port = htons(in_port);
 
-    if ((cli_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        msg << "TCP client could not connect to " << in_host << ":" << in_port <<
-            " - " << kis_strerror_r(errno);
-        _MSG(msg.str(), MSGFLAG_ERROR);
-        return -1;
-    }
-
-    // Bind the local socket
-    memset(&local_sock, 0, sizeof(local_sock));
-    local_sock.sin_family = AF_INET;
-    local_sock.sin_addr.s_addr = htonl(INADDR_ANY);
-    local_sock.sin_port = htons(0);
-
-    if (::bind(cli_fd, (struct sockaddr *) &local_sock, sizeof(local_sock)) < 0) {
-        msg << "TCP client could not connect to " << in_host << ":" << in_port <<
-            " - " << kis_strerror_r(errno);
-        _MSG(msg.str(), MSGFLAG_ERROR);
-        close(cli_fd);
+    if ((cli_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+        _MSG_ERROR("Could not connect to TCP server {}:{} ({} / errno {})",
+                in_host, in_port, kis_strerror_r(errno), errno);
         return -1;
     }
 
@@ -101,23 +93,23 @@ int TcpClientV2::Connect(std::string in_host, unsigned int in_port) {
 
     int ret;
 
-    if ((ret = connect(cli_fd, (struct sockaddr *) &client_sock, 
+    if ((ret = ::connect(cli_fd, (struct sockaddr *) &client_sock, 
                     sizeof(client_sock))) < 0) {
         if (errno == EINPROGRESS) {
             pending_connect = true;
         } else {
-            close(cli_fd);
+            _MSG_ERROR("Could not connect to TCP server {}:{} ({} / errno {})",
+                    in_host, in_port, kis_strerror_r(errno), errno);
+
+            if (cli_fd >= 0)
+                close(cli_fd);
             cli_fd = -1;
 
             connected = false;
             pending_connect = false;
 
-            msg << "TCP client could not connect to " << in_host << ":" << in_port <<
-                " - " << kis_strerror_r(errno);
-            _MSG(msg.str(), MSGFLAG_ERROR);
-
             // Send the error to any listeners
-            handler->BufferError(msg.str());
+            handler->buffer_error(msg.str());
 
             return -1;
         }
@@ -126,13 +118,12 @@ int TcpClientV2::Connect(std::string in_host, unsigned int in_port) {
         pending_connect = false;
     }
 
-    host = in_host;
-    port = in_port;
-
     return 0;
 }
 
-int TcpClientV2::MergeSet(int in_max_fd, fd_set *out_rset, fd_set *out_wset) {
+int tcp_client_v2::pollable_merge_set(int in_max_fd, fd_set *out_rset, fd_set *out_wset) {
+    local_locker l(tcp_mutex);
+
     // All we fill in is the descriptor for writing if we're still trying to
     // connect
     if (pending_connect) {
@@ -146,7 +137,7 @@ int TcpClientV2::MergeSet(int in_max_fd, fd_set *out_rset, fd_set *out_wset) {
         return in_max_fd;
 
     // If we have data waiting to be written, fill it in
-    if (handler->GetWriteBufferUsed()) {
+    if (handler->get_write_buffer_used()) {
         FD_SET(cli_fd, out_wset);
     }
 
@@ -159,8 +150,10 @@ int TcpClientV2::MergeSet(int in_max_fd, fd_set *out_rset, fd_set *out_wset) {
     return in_max_fd;
 }
 
-int TcpClientV2::Poll(fd_set& in_rset, fd_set& in_wset) {
-    std::stringstream msg;
+int tcp_client_v2::pollable_poll(fd_set& in_rset, fd_set& in_wset) {
+    local_locker l(tcp_mutex);
+    
+    std::string msg;
 
     uint8_t *buf;
     size_t len;
@@ -178,15 +171,17 @@ int TcpClientV2::Poll(fd_set& in_rset, fd_set& in_wset) {
             r = getsockopt(cli_fd, SOL_SOCKET, SO_ERROR, &e, &l);
 
             if (r < 0 || e != 0) {
-                msg << "TCP client could not connect to " << host << ":" << port <<
-                    " - " << kis_strerror_r(errno);
-                _MSG(msg.str(), MSGFLAG_ERROR);
+                msg = fmt::format("Could not connect to TCP server {}:{} ({} / errno {})",
+                        host, port, kis_strerror_r(e), e);
 
-                handler->BufferError(msg.str());
+                handler->buffer_error(msg);
 
-                close(cli_fd);
+                if (cli_fd >= 0)
+                    close(cli_fd);
+                cli_fd = -1;
                 connected = false;
                 pending_connect = false;
+
                 return 0;
             } else {
                 connected = true;
@@ -204,84 +199,112 @@ int TcpClientV2::Poll(fd_set& in_rset, fd_set& in_wset) {
         return 0;
 
     if (FD_ISSET(cli_fd, &in_rset)) {
+        // If we have pending data and the buffer is full, call the pending function immediately
+        if (handler->get_read_buffer_available() == 0)
+            handler->trigger_read_callback(0);
+
         // Allocate the biggest buffer we can fit in the ring, read as much
         // as we can at once.
        
-        while (handler->GetReadBufferAvailable() > 0) {
-            len = handler->ZeroCopyReserveReadBufferData((void **) &buf, 
-                    handler->GetReadBufferAvailable());
+        while (connected && handler->get_read_buffer_available() > 0) {
+            len = handler->zero_copy_reserve_read_buffer_data((void **) &buf, 
+                    handler->get_read_buffer_available());
 
-            if ((ret = read(cli_fd, buf, len)) <= 0) {
-                if (errno != EINTR && errno != EAGAIN) {
-                    // Push the error upstream if we failed to read here
-                    if (ret == 0) {
-                        msg << "TCP client closing " << host << ":" << port <<
-                            " - connection closed by remote side.";
-                    } else {
-                        msg << "TCP client error reading from " << host << ":" << port <<
-                            " - " << kis_strerror_r(errno);
-                    }
+            // We ought to never hit this because it ought to always be available
+            // from the above while loop, but lets be extra cautious
+            if (len <= 0) {
+                handler->commit_read_buffer_data(buf, 0);
+                break;
+            }
 
-                    // Dump the commit
-                    handler->CommitReadBufferData(buf, 0);
-                    handler->BufferError(msg.str());
+            ret = recv(cli_fd, buf, len, MSG_DONTWAIT);
 
-                    Disconnect();
-                    return 0;
-                } else {
-                    // Dump the commit
-                    handler->CommitReadBufferData(buf, 0);
+            if (ret < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Dump the commit, we didn't get any data
+                    handler->commit_read_buffer_data(buf, 0);
 
                     break;
+                } else {
+                    // Push the error upstream if we failed to read here
+                    msg = fmt::format("TCP client error reading from {}:{} - {} (errno {})",
+                            host, port, kis_strerror_r(errno), errno);
+
+                    // Dump the commit
+                    handler->commit_read_buffer_data(buf, 0);
+                    handler->buffer_error(msg);
+
+                    disconnect();
+                    return 0;
                 }
+            } else if (ret == 0) {
+                msg = fmt::format("TCP client closing connection to {}:{}, connection closed by remote",
+                        host, port);
+                // Dump the commit
+                handler->commit_read_buffer_data(buf, 0);
+                handler->buffer_error(msg);
+
+                disconnect();
+                return 0;
             } else {
-                // Finalize buffer
-                iret = handler->CommitReadBufferData(buf, ret);
+                // Process the data we got
+                iret = handler->commit_read_buffer_data(buf, ret);
 
                 if (!iret) {
                     // Die if we couldn't insert all our data, the error is already going
                     // upstream.
-                    Disconnect();
+                    disconnect();
                     return 0;
                 }
             }
-
-            // Should never get here
-            // delete[] buf;
         }
     }
 
-    if (FD_ISSET(cli_fd, &in_wset)) {
-        len = handler->GetWriteBufferUsed();
+    if (connected && FD_ISSET(cli_fd, &in_wset) && handler->get_write_buffer_used()) {
+        // Peek the entire data 
+        len = handler->zero_copy_peek_write_buffer_data((void **) &buf, 
+                handler->get_write_buffer_used());
 
-        // Peek the data into our buffer
-        ret = handler->ZeroCopyPeekWriteBufferData((void **) &buf, len);
+        ret = send(cli_fd, buf, len, MSG_DONTWAIT);
 
-        if ((iret = write(cli_fd, buf, len)) < 0) {
-            if (errno != EINTR && errno != EAGAIN) {
-                // Push the error upstream
-                msg << "TCP client error writing to " << host << ":" << port <<
-                    " - " << kis_strerror_r(errno);
+        if (ret < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                handler->peek_free_write_buffer_data(buf);
+                return 0;
+            } else {
+                msg = fmt::format("TCP client error writing to {}:{} - {} (errno {})",
+                    host, port, kis_strerror_r(errno), errno);
 
-                handler->PeekFreeWriteBufferData(buf);
-                handler->BufferError(msg.str());
+                handler->peek_free_write_buffer_data(buf);
+                handler->buffer_error(msg);
 
-                Disconnect();
+                disconnect();
                 return 0;
             }
+        } else if (ret == 0) {
+            msg = fmt::format("TCP client connection to {}:{} closed by remote",
+                    host, port);
+            handler->peek_free_write_buffer_data(buf);
+            handler->buffer_error(msg);
+            disconnect();
+            return 0;
         } else {
             // Consume whatever we managed to write
-            handler->PeekFreeWriteBufferData(buf);
-            handler->ConsumeWriteBufferData(iret);
+            handler->peek_free_write_buffer_data(buf);
+            handler->consume_write_buffer_data(ret);
         }
     }
 
     return 0;
 }
 
-void TcpClientV2::Disconnect() {
+void tcp_client_v2::disconnect() {
+    local_locker l(tcp_mutex);
+
     if (pending_connect || connected) {
-        close(cli_fd);
+        if (cli_fd >= 0)
+            close(cli_fd);
+        cli_fd = -1;
     }
 
     cli_fd = -1;
@@ -289,7 +312,12 @@ void TcpClientV2::Disconnect() {
     connected = false;
 }
 
-bool TcpClientV2::FetchConnected() {
-    return cli_fd > -1;
+bool tcp_client_v2::get_connected() {
+    local_shared_locker l(tcp_mutex);
+
+    if (connected || pending_connect)
+        return true;
+
+    return false;
 }
 

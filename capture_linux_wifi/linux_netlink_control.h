@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -22,7 +22,10 @@
 #define __LINUX_NETLINK_CONFIG__
 
 /* Use local copy of nl80211.h */
-#include "../nl80211.h"
+#include "nl80211.h"
+
+#include <stddef.h>
+#include <stdint.h>
 
 /* Create a monitor vif using mac80211, based on existing interface *interface
  * and named *newinterface.
@@ -44,14 +47,12 @@ int mac80211_create_monitor_vif(const char *interface, const char *newinterface,
  *
  * **nl_sock is allocated by the function, and must be freed with mac80211_nl_disconnect
  * *nl80211_id is populated by the function
- * *if_index is populated with the interface index of the provided interface
  *
  * Returns:
  * -1   Error
  *  0   Success
  */
-int mac80211_connect(const char *interface, void **nl_sock, int *nl80211_id, 
-        int *if_index, char *errstr);
+int mac80211_connect(void **nl_sock, int *nl80211_id, char *errstr);
 
 /* Disconnect from nl80211; frees resources used */
 void mac80211_disconnect(void *nl_sock);
@@ -99,6 +100,28 @@ int mac80211_set_frequency_cache(int ifidx, void *nl_sock, int nl80211_id,
         unsigned int control_freq, unsigned int chan_width, unsigned int center_freq1, 
         unsigned int center_freq2, char *errstr);
 
+/* Get frequency info about the interface, if we can.
+ * All values from control_freq to errstr are filled in by this call.
+ *
+ * Returns: 
+ * -1   Error
+ *  0   Success
+ *
+ */
+int mac80211_get_frequency_cache(int ifidx, void *nl_sock, int nl80211_id,
+        unsigned int *control_freq, unsigned int *chan_type, 
+        unsigned int *chan_width, unsigned int *center_freq1,
+        unsigned int *center_freq2, char *errstr);
+
+/* Get the mode of an interface
+ * Fills *iftype with a NL80211_IFTYPE
+ *
+ * Returns:
+ * -1   Error
+ *  0   Success
+ */
+int mac80211_get_iftype_cache(int ifidx, void *nl_sock, int nl80211_id, uint32_t *iftype, char *errstr);
+
 /* Get the parent phy of an interface.
  *
  * Returns:
@@ -124,6 +147,7 @@ char *mac80211_find_parent(const char *interface);
  * Channels are returned as Kismet channel definitions, as wifi channel strings; for
  * example:
  * Base channel:    6
+ * HT20 channel:    6HT20
  * HT40+ channel:   6HT40+
  * HT40- channel:   6HT40-
  * HT80 channel:    36HT80 (which automatically derives 80mhz control channel)
@@ -133,13 +157,23 @@ char *mac80211_find_parent(const char *interface);
  *
  * Caller is responsible for freeing returned chanlist with mac80211_free_chanlist(..)
  *
+ * If default_ht20 is true, then for any interface capable of ht20, all
+ * 20mhz channels will be returned as ht20 channels.  expand_ht20 will be
+ * ignored.
+ *
+ * If expand_ht20 is true (and default_ht20 is false), then for any interface
+ * capable of ht20, all 20mhz channels will be reported as both non-ht and ht20
+ * in the returned list.
+ *
  * Returns:
  * -1   Error
  *  0   Success
  *
  */
 int mac80211_get_chanlist(const char *interface, unsigned int extended_flags, char *errstr,
-        char ***ret_chanlist, unsigned int *ret_chanlist_len);
+        unsigned int default_ht20, unsigned int expand_ht20,
+        char ***ret_chanlist, size_t *ret_chanlist_len);
+
 
 #endif
 

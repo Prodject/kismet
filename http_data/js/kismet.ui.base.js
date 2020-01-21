@@ -8,8 +8,21 @@
 
 var exports = {};
 
+var local_uri_prefix = "";
+if (typeof(KISMET_URI_PREFIX) !== 'undefined')
+    local_uri_prefix = KISMET_URI_PREFIX;
+
 // Flag we're still loading
 exports.load_complete = 0;
+
+/* Fetch the system user */
+$.get(local_uri_prefix + "system/user_status.json")
+.done(function(data) {
+    exports.system_user = data['kismet.system.user'];
+})
+.fail(function() {
+    exports.system_user = "[unknown]";
+});
 
 // Load our css
 $('<link>')
@@ -17,8 +30,35 @@ $('<link>')
     .attr({
         type: 'text/css',
         rel: 'stylesheet',
-        href: '/css/kismet.ui.base.css'
+        href: local_uri_prefix + 'css/kismet.ui.base.css'
     });
+
+/* Call from index to set the required ajax parameters universally */
+exports.ConfigureAjax = function() {
+    $.ajaxSetup({
+        beforeSend: function (xhr) {
+            var user = kismet.getStorage('kismet.base.login.username', 'kismet');
+            var pw =  kismet.getStorage('kismet.base.login.password', '');
+
+            xhr.setRequestHeader ("Authorization", "Basic " + btoa(user + ":" + pw));
+        },
+
+        /*
+        dataFilter: function(data, type) {
+            try {
+                var json = JSON.parse(data);
+                var sjson = kismet.sanitizeObject(json);
+                console.log(JSON.stringify(sjson));
+                return JSON.stringify(sjson);
+            } catch {
+                return data;
+            }
+        },
+        */
+    });
+}
+
+exports.ConfigureAjax();
 
 /* Define some callback functions for the table */
 
@@ -54,6 +94,30 @@ exports.renderChannel = function(data, type, row, meta) {
 
 exports.renderPackets = function(data, type, row, meta) {
     return "<i>Preparing graph</i>";
+}
+
+exports.renderUsecTime = function(data, type, row, meta) {
+    if (data == 0)
+        return "<i>n/a</i>";
+
+    var data_sec = data / 1000000;
+
+    var days = Math.floor(data_sec / 86400);
+    var hours = Math.floor((data_sec / 3600) % 24);
+    var minutes = Math.floor((data_sec / 60) % 60);
+    var seconds = Math.floor(data_sec % 60);
+
+    var ret = "";
+
+    if (days > 0)
+        ret = ret + days + "d ";
+    if (hours > 0 || days > 0)
+        ret = ret + hours + "h ";
+    if (minutes > 0 || hours > 0 || days > 0)
+        ret = ret + minutes + "m ";
+    ret = ret + seconds + "s";
+
+    return ret;
 }
 
 exports.drawPackets = function(dyncolumn, table, row) {
@@ -126,9 +190,23 @@ kismet_ui.AddDeviceColumn('column_phy', {
     width: "8em",
 });
 
+kismet_ui.AddDeviceColumn('column_crypto', {
+    sTitle: 'Crypto',
+    field: 'kismet.device.base.crypt',
+    description: 'Encryption',
+    width: "8em",
+    renderfunc: function(d, t, r, m) {
+        if (d == "") {
+            return "n/a";
+        }
+
+        return d;
+    },
+});
+
 kismet_ui.AddDeviceColumn('column_signal', {
     sTitle: 'Signal',
-    field: 'kismet.device.base.signal/kismet.common.signal.last_signal_dbm',
+    field: 'kismet.device.base.signal/kismet.common.signal.last_signal',
     description: 'Last-seen signal',
     width: "6em",
     renderfunc: function(d, t, r, m) {
@@ -160,6 +238,18 @@ kismet_ui.AddDeviceColumn('column_time', {
     renderfunc: function(d, t, r, m) {
         return exports.renderLastTime(d, t, r, m);
     },
+});
+
+kismet_ui.AddDeviceColumn('column_first_time', {
+    sTitle: 'First Seen',
+    field: 'kismet.device.base.first_time',
+    description: 'First-seen time',
+    renderfunc: function(d, t, r, m) {
+        return exports.renderLastTime(d, t, r, m);
+    },
+    searchable: true,
+    visible: false,
+    orderable: true,
 });
 
 kismet_ui.AddDeviceColumn('column_datasize', {
@@ -289,7 +379,7 @@ kismet_ui.AddDeviceColumn('column_manuf', {
 //
 // The draw function will populate the kismet devicedata when pinged
 kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
-    draw: function(data, target) {
+    draw: function(data, target, options, storage) {
         target.devicedata(data, {
             "id": "genericDeviceData",
             "fields": [
@@ -297,13 +387,13 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 field: "kismet.device.base.name",
                 title: "Name",
                 help: "Device name, derived from device characteristics or set as a custom name by the user.",
-                render: function(opts) {
+                draw: function(opts) {
                     var name = opts['data']['kismet.device.base.username'];
                     
-                    if (name === "")
-                        name = opts['value'];
+                    if (typeof(name) == 'undefined' || name == "")
+                        name = opts['data']['kismet.device.base.commonname'];
 
-                    if (name === "")
+                    if (typeof(name) == 'undefined' || name == "")
                         name = opts['data']['kismet.device.base.macaddr'];
 
                     var nameobj = 
@@ -312,19 +402,15 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                         })
                         .html(name);
 
-                    exports.LoginCheck(function(success) { 
-                        if (success) {
-                            nameobj.editable({
-                                type: 'text',
-                                mode: 'inline',
-                                success: function(response, newvalue) {
-                                    var jscmd = {
-                                        "username": newvalue
-                                    };
-                                    var postdata = "json=" + encodeURIComponent(JSON.stringify(jscmd));
-                                    $.post("/devices/by-key/" + opts['data']['kismet.device.base.key'] + "/set_name.cmd", postdata, "json");
-                                }
-                            });
+                    nameobj.editable({
+                        type: 'text',
+                        mode: 'inline',
+                        success: function(response, newvalue) {
+                            var jscmd = {
+                                "username": newvalue
+                            };
+                            var postdata = "json=" + encodeURIComponent(JSON.stringify(jscmd));
+                            $.post(local_uri_prefix + "devices/by-key/" + opts['data']['kismet.device.base.key'] + "/set_name.cmd", postdata, "json");
                         }
                     });
 
@@ -336,7 +422,7 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 field: "kismet.device.base.tags/notes",
                 title: "Notes",
                 help: "Abritrary notes",
-                render: function(opts) {
+                draw: function(opts) {
                     var notes = opts['data']['kismet.device.base.tags']['notes'];
 
                     if (notes == null)
@@ -349,20 +435,16 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                         })
                         .html(notes.convertNewlines());
 
-                    exports.LoginCheck(function(success) { 
-                        if (success) {
-                            notesobj.editable({
-                                type: 'text',
-                                mode: 'inline',
-                                success: function(response, newvalue) {
-                                    var jscmd = {
-                                        "tagname": "notes",
-                                        "tagvalue": newvalue.escapeSpecialChars(),
-                                    };
-                                    var postdata = "json=" + encodeURIComponent(JSON.stringify(jscmd));
-                                    $.post("/devices/by-key/" + opts['data']['kismet.device.base.key'] + "/set_tag.cmd", postdata, "json");
-                                }
-                            });
+                    notesobj.editable({
+                        type: 'text',
+                        mode: 'inline',
+                        success: function(response, newvalue) {
+                            var jscmd = {
+                                "tagname": "notes",
+                                "tagvalue": newvalue.escapeSpecialChars(),
+                            };
+                            var postdata = "json=" + encodeURIComponent(JSON.stringify(jscmd));
+                            $.post(local_uri_prefix + "devices/by-key/" + opts['data']['kismet.device.base.key'] + "/set_tag.cmd", postdata, "json");
                         }
                     });
 
@@ -384,20 +466,23 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
             },
             {
                 field: "kismet.device.base.type",
+                liveupdate: true,
                 title: "Type",
                 empty: "<i>Unknown</i>"
             },
             {
                 field: "kismet.device.base.first_time",
+                liveupdate: true,
                 title: "First Seen",
-                render: function(opts) {
+                draw: function(opts) {
                     return new Date(opts['value'] * 1000);
                 }
             },
             {
                 field: "kismet.device.base.last_time",
+                liveupdate: true,
                 title: "Last Seen",
-                render: function(opts) {
+                draw: function(opts) {
                     return new Date(opts['value'] * 1000);
                 }
             },
@@ -405,6 +490,7 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 field: "group_frequency",
                 groupTitle: "Frequencies",
                 id: "group_frequency",
+                liveupdate: true,
 
                 fields: [
                 {
@@ -417,7 +503,7 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                     field: "kismet.device.base.frequency",
                     title: "Main Frequency",
                     help: "The primary frequency of the device, if known.  Not all phy types advertise a fixed frequency in packets.",
-                    render: function(opts) {
+                    draw: function(opts) {
                         return kismet.HumanReadableFrequency(opts['value']);
                     },
                     filterOnZero: true,
@@ -425,33 +511,69 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 {
                     field: "frequency_map",
                     span: true,
+                    liveupdate: true,
                     filter: function(opts) {
                         return (Object.keys(opts['data']['kismet.device.base.freq_khz_map']).length >= 1);
                     },
                     render: function(opts) {
-                        return '<center>Packet Frequency Distribution</center><div class="freqbar" id="' + opts['key'] + '" />';
+                        var d = 
+                            $('<div>', {
+                                style: 'width: 80%; height: 250px',
+                            })
+                            .append(
+                                $('<canvas>', {
+                                    id: 'freqdist',
+                                })
+                            );
+
+                        return d;
+
                     },
                     draw: function(opts) {
-                        var bardiv = $('div', opts['container']);
-
-                        // Make an array morris likes using our whole data record
-                        var moddata = new Array();
+                        var legend = new Array();
+                        var data = new Array();
 
                         for (var fk in opts['data']['kismet.device.base.freq_khz_map']) {
-                            moddata.push({
-                                y: kismet.HumanReadableFrequency(parseInt(fk)),
-                                c: opts['data']['kismet.device.base.freq_khz_map'][fk]
-                            });
+                            legend.push(kismet.HumanReadableFrequency(parseInt(fk)));
+                            data.push(opts['data']['kismet.device.base.freq_khz_map'][fk]);
                         }
 
-                        Morris.Bar({
-                            element: bardiv,
-                            data: moddata,
-                            xkey: 'y',
-                            ykeys: ['c'],
-                            labels: ['Packets'],
-                            hideHover: 'auto'
-                        });
+                        var barChartData = {
+                            labels: legend,
+
+                            datasets: [{
+                                label: 'Dataset 1',
+                                backgroundColor: 'rgba(46, 99, 162, 1)',
+                                borderWidth: 0,
+                                data: data,
+                            }]
+
+                        };
+
+                        if ('freqchart' in window[storage]) {
+                            window[storage].freqchart.data.labels = legend;
+                            window[storage].freqchart.data.datasets[0].data = data;
+                            window[storage].freqchart.update();
+                        } else {
+                            window[storage].freqchart = 
+                                new Chart($('canvas', opts['container']), {
+                                    type: 'bar',
+                                    data: barChartData,
+                                    options: {
+                                        maintainAspectRatio: false,
+                                        animation: false,
+                                        legend: {
+                                            display: false,
+                                        },
+                                        title: {
+                                            display: true,
+                                            text: 'Packet frequency distribution'
+                                        }
+                                    }
+                                });
+
+                            window[storage].freqchart.update();
+                        }
                     }
                 },
                 ]
@@ -462,10 +584,9 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 id: "group_signal_data",
 
                 filter: function(opts) {
-                    var db = kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.last_signal_dbm");
-                    var rssi = kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.last_signal_rssi");
+                    var db = kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.last_signal");
 
-                    if (db == 0 && rssi == 0)
+                    if (db == 0)
                         return false;
 
                     return true;
@@ -538,125 +659,79 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                     */
 
                 },
-                { // Only show when dbm
-                    field: "kismet.device.base.signal/kismet.common.signal.last_signal_dbm",
+                {
+                    field: "kismet.device.base.signal/kismet.common.signal.last_signal",
+                    liveupdate: true,
                     title: "Latest Signal",
-                    help: "Most recent signal level seen, in dBm.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
-                    render: function(opts) {
-                        return opts['value'] + " dBm";
+                    help: "Most recent signal level seen.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
+                    draw: function(opts) {
+                        return opts['value'] + " " + data["kismet.device.base.signal"]["kismet.common.signal.type"];
                     },
                     filterOnZero: true,
                 },
-                { // Only show when rssi
-                    field: "kismet.device.base.signal/kismet.common.signal.last_signal_rssi",
-                    title: "Latest Signal",
-                    help: "Most recent signal level seen, in RSSI.  RSSI signals are specific to the drivers reporting them and cannot be converted to a known dBm signal level.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
-                    render: function(opts) {
-                        return opts['value'] + " RSSI";
-                    },
-                    filterOnZero: true,
-                },
-                { // Only show when dbm
-                    field: "kismet.device.base.signal/kismet.common.signal.last_noise_dbm",
+                { 
+                    field: "kismet.device.base.signal/kismet.common.signal.last_noise",
+                    liveupdate: true,
                     title: "Latest Noise",
-                    help: "Most recent noise level seen, in dBm.  Few drivers can report noise levels.",
-                    render: function(opts) {
-                        return opts['value'] + " dBm";
+                    help: "Most recent noise level seen.  Few drivers can report noise levels.",
+                    draw: function(opts) {
+                        return opts['value'] + " " + data["kismet.device.base.signal"]["kismet.common.signal.type"];
                     },
                     filterOnZero: true,
                 },
-                { // Only show when rssi
-                    field: "kismet.device.base.signal/kismet.common.signal.last_noise_rssi",
-                    title: "Latest Noise",
-                    help: "Most recent noise level seen, in RSSI.  RSSI levels are specific to the drivers reporting them and cannot be converted to a known dBm signal level.  Few drivers can report noise levels.",
-                    render: function(opts) {
-                        return opts['value'] + " RSSI";
-                    },
-                    filterOnZero: true,
-                },
-                { // Only show when dbm
-                    field: "kismet.device.base.signal/kismet.common.signal.min_signal_dbm",
+                { 
+                    field: "kismet.device.base.signal/kismet.common.signal.min_signal",
+                    liveupdate: true,
                     title: "Min. Signal",
-                    help: "Weakest signal level seen, in dBm.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
-                    render: function(opts) {
-                        return opts['value'] + " dBm";
+                    help: "Weakest signal level seen.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
+                    draw: function(opts) {
+                        return opts['value'] + " " + data["kismet.device.base.signal"]["kismet.common.signal.type"];
                     },
                     filterOnZero: true,
                 },
-                { // Only show when rssi
-                    field: "kismet.device.base.signal/kismet.common.signal.min_signal_rssi",
-                    title: "Min. Signal",
-                    help: "Weakest signal level seen, in RSSI.  RSSI values are specific to the capture driver and cannot be converted to standard dBm signal levels.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
-                    render: function(opts) {
-                        return opts['value'] + " RSSI";
-                    },
-                    filterOnZero: true,
-                },
-                { // Only show when dbm
-                    field: "kismet.device.base.signal/kismet.common.signal.max_signal_dbm",
+
+                { 
+                    field: "kismet.device.base.signal/kismet.common.signal.max_signal",
+                    liveupdate: true,
                     title: "Max. Signal",
-                    help: "Strongest signal level seen, in dBm.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
-                    render: function(opts) {
-                        return opts['value'] + " dBm";
+                    help: "Strongest signal level seen.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
+                    draw: function(opts) {
+                        return opts['value'] + " " + data["kismet.device.base.signal"]["kismet.common.signal.type"];
                     },
                     filterOnZero: true,
                 },
-                { // Only show when rssi
-                    field: "kismet.device.base.signal/kismet.common.signal.max_signal_rssi",
-                    title: "Max. Signal",
-                    help: "Strongest signal level seen, in RSSI.  RSSI values are specific to the capture driver and cannot be converted to standard dBm signal levels.  Signal levels may vary significantly depending on the data rates used by the device, and often, wireless drivers and devices cannot report strictly accurate signal levels.",
-                    filterOnZero: true,
-                    render: function(opts) {
-                        return opts['value'] + " RSSI";
-                    },
-                },
-                { // Only show when dbm
-                    field: "kismet.device.base.signal/kismet.common.signal.min_noise_dbm",
+                { 
+                    field: "kismet.device.base.signal/kismet.common.signal.min_noise",
+                    liveupdate: true,
                     title: "Min. Noise",
                     filterOnZero: true,
-                    help: "Least amount of interference or noise seen, in dBm.  Most capture drivers are not capable of measuring noise levels.",
-                    render: function(opts) {
-                        return opts['value'] + " dBm";
+                    help: "Least amount of interference or noise seen.  Most capture drivers are not capable of measuring noise levels.",
+                    draw: function(opts) {
+                        return opts['value'] + " " + data["kismet.device.base.signal"]["kismet.common.signal.type"];
                     },
                 },
-                { // Only show when rssi
-                    field: "kismet.device.base.signal/kismet.common.signal.min_noise_rssi",
-                    title: "Min. Noise",
-                    filterOnZero: true,
-                    help: "Least amount of interference or noise seen, in RSSI.  Most capture drivers are not capable of measuring noise levels.",
-                    render: function(opts) {
-                        return opts['value'] + " RSSI";
-                    },
-                },
-                { // Only show when dbm
-                    field: "kismet.device.base.signal/kismet.common.signal.max_noise_dbm",
+                { 
+                    field: "kismet.device.base.signal/kismet.common.signal.max_noise",
+                    liveupdate: true,
                     title: "Max. Noise",
                     filterOnZero: true,
-                    help: "Largest amount of interference or noise seen, in dBm.  Most capture drivers are not capable of measuring noise levels.",
-                    render: function(opts) {
-                        return opts['value'] + " dBm";
-                    },
-                },
-                { // Only show when rssi
-                    field: "kismet.device.base.signal/kismet.common.signal.max_noise_rssi",
-                    title: "Max. Noise",
-                    filterOnZero: true,
-                    help: "Largest amount of interference or noise seen, in dBm.  Most capture drivers are not capable of measuring noise levels.",
-                    render: function(opts) {
-                        return opts['value'] + " RSSI";
+                    help: "Largest amount of interference or noise seen.  Most capture drivers are not capable of measuring noise levels.",
+                    draw: function(opts) {
+                        return opts['value'] + " " + data["kismet.device.base.signal"]["kismet.common.signal.type"];
                     },
                 },
                 { // Pseudo-field of aggregated location, only show when the location is valid
                     field: "kismet.device.base.signal/kismet.common.signal.peak_loc",
+                    liveupdate: true,
                     title: "Peak Location",
                     help: "When a GPS location is available, the peak location is the coordinates at which the strongest signal level was recorded for this device.",
                     filter: function(opts) {
                         return kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.peak_loc/kismet.common.location.valid") == 1;
                     },
-                    render: function(opts) {
+                    draw: function(opts) {
                         var loc =
-                            kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.peak_loc/kismet.common.location.lat") + ", " +
-                            kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.peak_loc/kismet.common.location.lon");
+                            kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.peak_loc/kismet.common.location.geopoint[1]") + ", " +
+                            kismet.ObjectByString(opts['data'], "kismet.device.base.signal/kismet.common.signal.peak_loc/kismet.common.location.geopoint[0]");
 
                         return loc;
                     },
@@ -673,65 +748,112 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 {
                     field: "graph_field_overall",
                     span: true,
+                    liveupdate: true,
                     render: function(opts) {
-                        return '<div class="donut" id="' + opts['key'] + '" />';
+                        var d = 
+                            $('<div>', {
+                                style: 'width: 80%; height: 250px; padding-bottom: 5px;',
+                            })
+                            .append(
+                                $('<canvas>', {
+                                    id: 'packetdonut',
+                                })
+                            );
+
+                        return d;
                     },
                     draw: function(opts) {
-                        var donutdiv = $('div', opts['container']);
-
-                        // Make an array morris likes using our whole data record
-                        var moddata = [
-                        { label: "LLC/Management",
-                            value: opts['data']['kismet.device.base.packets.llc'] },
-                        { label: "Data",
-                            value: opts['data']['kismet.device.base.packets.data'] }
+                        var legend = ['LLC/Management', 'Data'];
+                        var data = [
+                            opts['data']['kismet.device.base.packets.llc'],
+                            opts['data']['kismet.device.base.packets.data'],
+                        ];
+                        var colors = [
+                            'rgba(46, 99, 162, 1)',
+                            'rgba(96, 149, 212, 1)',
                         ];
 
-                        if (opts['data']['kismet.device.base.packets.error'] != 0)
-                            moddata.push({ label: "Error",
-                                value: opts['data']['kismet.device.base.packets.error'] });
+                        var barChartData = {
+                            labels: legend,
 
-                        Morris.Donut({
-                            element: donutdiv,
-                            data: moddata
-                        });
-                    }
+                            datasets: [{
+                                label: 'Dataset 1',
+                                backgroundColor: colors,
+                                borderWidth: 0,
+                                data: data,
+                            }],
+                        };
+
+                        if ('packetdonut' in window[storage]) {
+                            window[storage].packetdonut.data.datasets[0].data = data;
+                            window[storage].packetdonut.update();
+                        } else {
+                            window[storage].packetdonut = 
+                                new Chart($('canvas', opts['container']), {
+                                    type: 'doughnut',
+                                    data: barChartData,
+                                    options: {
+                                        global: {
+                                            maintainAspectRatio: false,
+                                        },
+                                        animation: false,
+                                        legend: {
+                                            display: true,
+                                        },
+                                        title: {
+                                            display: true,
+                                            text: 'Packet Types'
+                                        },
+                                        height: '200px',
+                                    }
+                                });
+
+                            window[storage].packetdonut.render();
+                        }
+                    },
                 },
                 {
                     field: "kismet.device.base.packets.total",
+                    liveupdate: true,
                     title: "Total Packets",
                     help: "Count of all packets of all types",
                 },
                 {
                     field: "kismet.device.base.packets.llc",
+                    liveupdate: true,
                     title: "LLC/Management",
                     help: "LLC (Link Layer Control) and Management packets are typically used for controlling and defining wireless networks.  Typically they do not carry data.",
                 },
                 {
                     field: "kismet.device.base.packets.error",
+                    liveupdate: true,
                     title: "Error/Invalid",
                     help: "Error and invalid packets indicate a packet was received and was partially processable, but was damaged or incorrect in some way.  Most error packets are dropped completely as it is not possible to associate them with a specific device.",
                 },
                 {
                     field: "kismet.device.base.packets.data",
+                    liveupdate: true,
                     title: "Data",
                     help: "Data frames carry messages and content for the device.",
                 },
                 {
                     field: "kismet.device.base.packets.crypt",
+                    liveupdate: true,
                     title: "Encrypted",
                     help: "Some data frames can be identified by Kismet as carrying encryption, either by the contents or by packet flags, depending on the phy type",
                 },
                 {
                     field: "kismet.device.base.packets.filtered",
+                    liveupdate: true,
                     title: "Filtered",
                     help: "Filtered packets are ignored by Kismet",
                 },
                 {
                     field: "kismet.device.base.datasize",
+                    liveupdate: true,
                     title: "Data Transferred",
                     help: "Amount of data transferred",
-                    render: function(opts) {
+                    draw: function(opts) {
                         return kismet.HumanReadableSize(opts['value']);
                     }
                 }
@@ -756,39 +878,56 @@ kismet_ui.AddDeviceDetail("base", "Device Info", -1000, {
                 // Fields in subgroup
                 fields: [
                 {
-                    field: "kismet.device.base.location/kismet.common.location.avg_loc/kismet.common.location.lat",
-                    title: "Latitude"
-                },
-                {
-                    field: "kismet.device.base.location/kismet.common.location.avg_loc/kismet.common.location.lon",
-                    title: "Longitude"
+                    field: "kismet.device.base.location/kismet.common.location.avg_loc/kismet.common.location.geopoint",
+                    title: "Location",
+                    draw: function(opts) {
+                        try {
+                            if (opts['value'][1] == 0 || opts['value'][0] == 0)
+                                return "<i>Unknown</i>";
+
+                            return opts['value'][1] + ", " + opts['value'][0]
+                        } catch (error) {
+                            return "<i>Unknown</i>";
+                        }
+                    }
                 },
                 {
                     field: "kismet.device.base.location/kismet.common.location.avg_loc/kismet.common.location.alt",
-                    title: "Altitude (meters)",
+                    title: "Altitude",
                     filter: function(opts) {
                         return (kismet.ObjectByString(opts['data'], "kismet.device.base.location/kismet.common.location.avg_loc/kismet.common.location.fix") >= 3);
-                    }
-
+                    },
+                    draw: function(opts) {
+                        try {
+                            return kismet_ui.renderHeightDistance(opts['value']);
+                        } catch (error) {
+                            return "<i>Unknown</i>";
+                        }
+                    },
                 }
                 ],
             }
             ]
-        });
+        }, storage);
     }
 });
 
 kismet_ui.AddDeviceDetail("packets", "Packet Graphs", 10, {
     render: function(data) {
         // Make 3 divs for s, m, h RRD
-        return '<b>Packet Rates</b><br /><br />' +
+        var ret = 
+            '<b>Packet Rates</b><br /><br />' +
             'Packets per second (last minute)<br /><div /><br />' +
             'Packets per minute (last hour)<br /><div /><br />' +
-            'Packets per hour (last day)<br /><div />' +
-            '<br /><b>Data</b><br /><br />' +
+            'Packets per hour (last day)<br /><div />';
+
+        if ('kismet.device.base.datasize.rrd' in data)
+            ret += '<br /><b>Data</b><br /><br />' +
             'Data per second (last minute)<br /><div /><br />' +
             'Data per minute (last hour)<br /><div /><br />' +
             'Data per hour (last day)<br /><div />';
+
+        return ret;
     },
     draw: function(data, target) {
         var m = $('div:eq(0)', target);
@@ -799,35 +938,46 @@ kismet_ui.AddDeviceDetail("packets", "Packet Graphs", 10, {
         var dh = $('div:eq(4)', target);
         var dd = $('div:eq(5)', target);
 
-        var mdata = kismet.RecalcRrdData(data['kismet.device.base.packets.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_SECOND, data['kismet.device.base.packets.rrd']['kismet.common.rrd.minute_vec'], {});
-        var hdata = kismet.RecalcRrdData(data['kismet.device.base.packets.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_MINUTE, data['kismet.device.base.packets.rrd']['kismet.common.rrd.hour_vec'], {});
-        var ddata = kismet.RecalcRrdData(data['kismet.device.base.packets.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_HOUR, data['kismet.device.base.packets.rrd']['kismet.common.rrd.day_vec'], {});
+        var mdata = [];
+        var hdata = [];
+        var ddata = [];
 
-        var dmdata = kismet.RecalcRrdData(data['kismet.device.base.datasize.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_SECOND, data['kismet.device.base.datasize.rrd']['kismet.common.rrd_minute_vec'], {});
-        var dhdata = kismet.RecalcRrdData(data['kismet.device.base.datasize.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_MINUTE, data['kismet.device.base.datasize.rrd']['kismet.common.rrd.hour_vec'], {});
-        var dddata = kismet.RecalcRrdData(data['kismet.device.base.datasize.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_HOUR, data['kismet.device.base.datasize.rrd']['kismet.common.rrd_day_vec'], {});
+        if (('kismet.device.base.packets.rrd' in data)) {
+            mdata = kismet.RecalcRrdData(data['kismet.device.base.packets.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_SECOND, data['kismet.device.base.packets.rrd']['kismet.common.rrd.minute_vec'], {});
+            hdata = kismet.RecalcRrdData(data['kismet.device.base.packets.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_MINUTE, data['kismet.device.base.packets.rrd']['kismet.common.rrd.hour_vec'], {});
+            ddata = kismet.RecalcRrdData(data['kismet.device.base.packets.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_HOUR, data['kismet.device.base.packets.rrd']['kismet.common.rrd.day_vec'], {});
 
-        m.sparkline(mdata, { type: "bar",
-                height: 12,
-                barColor: '#000000',
-                nullColor: '#000000',
-                zeroColor: '#000000'
-            });
-        h.sparkline(hdata,
-            { type: "bar",
-                height: 12,
-                barColor: '#000000',
-                nullColor: '#000000',
-                zeroColor: '#000000'
-            });
-        d.sparkline(ddata,
-            { type: "bar",
-                height: 12,
-                barColor: '#000000',
-                nullColor: '#000000',
-                zeroColor: '#000000'
-            });
+            m.sparkline(mdata, { type: "bar",
+                    height: 12,
+                    barColor: '#000000',
+                    nullColor: '#000000',
+                    zeroColor: '#000000'
+                });
+            h.sparkline(hdata,
+                { type: "bar",
+                    height: 12,
+                    barColor: '#000000',
+                    nullColor: '#000000',
+                    zeroColor: '#000000'
+                });
+            d.sparkline(ddata,
+                { type: "bar",
+                    height: 12,
+                    barColor: '#000000',
+                    nullColor: '#000000',
+                    zeroColor: '#000000'
+                });
+        } else {
+            m.html("<i>No packet data available</i>");
+            h.html("<i>No packet data available</i>");
+            d.html("<i>No packet data available</i>");
+        }
+            
 
+        if ('kismet.device.base.datasize.rrd' in data) {
+            var dmdata = kismet.RecalcRrdData(data['kismet.device.base.datasize.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_SECOND, data['kismet.device.base.datasize.rrd']['kismet.common.rrd_minute_vec'], {});
+            var dhdata = kismet.RecalcRrdData(data['kismet.device.base.datasize.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_MINUTE, data['kismet.device.base.datasize.rrd']['kismet.common.rrd.hour_vec'], {});
+            var dddata = kismet.RecalcRrdData(data['kismet.device.base.datasize.rrd']['kismet.common.rrd.last_time'], kismet_ui.last_timestamp, kismet.RRD_HOUR, data['kismet.device.base.datasize.rrd']['kismet.common.rrd_day_vec'], {});
         dm.sparkline(dmdata,
             { type: "bar",
                 height: 12,
@@ -849,6 +999,8 @@ kismet_ui.AddDeviceDetail("packets", "Packet Graphs", 10, {
                 nullColor: '#000000',
                 zeroColor: '#000000'
             });
+        }
+
     }
 });
 
@@ -856,7 +1008,7 @@ kismet_ui.AddDeviceDetail("seenby", "Seen By", 900, {
     filter: function(data) {
         return (Object.keys(data['kismet.device.base.seenby']).length > 1);
     },
-    draw: function(data, target) {
+    draw: function(data, target, options, storage) {
         target.devicedata(data, {
             id: "seenbyDeviceData",
 
@@ -896,7 +1048,7 @@ kismet_ui.AddDeviceDetail("seenby", "Seen By", 900, {
 
 kismet_ui.AddDeviceDetail("devel", "Dev/Debug Options", 10000, {
     render: function(data) {
-        return 'Device JSON: <a href="/devices/by-key/' + data['kismet.device.base.key'] + '/device.json" target="_new">link</a><br />';
+        return 'Device JSON: <a href="devices/by-key/' + data['kismet.device.base.key'] + '/device.prettyjson" target="_new">link</a><br />';
     }});
 
 /* Sidebar:  Memory monitor
@@ -912,14 +1064,16 @@ kismet_ui_sidebar.AddSidebarItem({
     },
 });
 
+/*
 kismet_ui_sidebar.AddSidebarItem({
     id: 'pcap_sidebar',
     priority: 10000,
     listTitle: '<i class="fa fa-download"></i> Download Pcap-NG',
     clickCallback: function() {
-        location.href = "/datasource/pcap/all_sources.pcapng";
+        location.href = "datasource/pcap/all_sources.pcapng";
     },
 });
+*/
 
 var memoryupdate_tid;
 var memory_panel = null;
@@ -971,8 +1125,9 @@ function memorydisplay_refresh() {
     if (memory_panel.is(':hidden'))
         return;
 
-    $.get("/system/status.json")
+    $.get(local_uri_prefix + "system/status.json")
     .done(function(data) {
+        console.log(data);
         // Common rrd type and source field
         var rrdtype = kismet.RRD_MINUTE;
         var rrddata = 'kismet.common.rrd.hour_vec';
@@ -1243,7 +1398,7 @@ kismet_ui_settings.AddSettingsPane({
     create: function(elem) {
         elem.append($('<i>').html('Loading plugin data...'));
 
-        $.get("/plugins/all_plugins.json")
+        $.get(local_uri_prefix + "plugins/all_plugins.json")
         .done(function(data) {
             elem.empty();
     
@@ -1318,11 +1473,11 @@ kismet_ui_settings.AddSettingsPane({
                 )
                 .append(
                     $('<p>')
-                    .html('Kismet requires a username and password for functionality which changes the server, such as adding interfaces or changing configuration.')
+                    .html('Kismet requires a username and password for functionality which changes the server, such as adding interfaces or changing configuration, or accessing some types of data.')
                 )
                 .append(
                     $('<p>')
-                    .html('By default, the first time Kismet runs it generates a random password, which is stored in the file <code>~/.kismet/kismet_httpd.conf</code> in the home directory of the user running Kismet.  You will need this password to configure data sources, download pcap and other logs, or change server-side settings.')
+                    .html('The Kismet password is stored in <code>~/.kismet/kismet_httpd.conf</code> in the home directory of the user running Kismet.  You will need this password to configure data sources, download pcap and other logs, or change server-side settings.<br>This server is running as <code>' + exports.system_user + '</code>, so the password can be found in <code>~' + exports.system_user + '/.kismet/kismet_httpd.conf</code>')
                 )
                 .append(
                     $('<p>')
@@ -1610,7 +1765,7 @@ function devsignal_refresh(key, devsignal_panel, devsignal_chart,
 
     var signal = lastsignal;
 
-    $.get("/devices/by-key/" + key + "/device.json")
+    $.get(local_uri_prefix + "devices/by-key/" + key + "/device.json")
     .done(function(data) {
         var title = '<i class="fa fa-signal" /> Signal ' +
             data['kismet.device.base.macaddr'] + ' ' +
@@ -1624,7 +1779,7 @@ function devsignal_refresh(key, devsignal_panel, devsignal_chart,
         sigicon.removeClass('fa-arrow-up');
         sigicon.removeClass('fa-arrow-down');
 
-        signal = data['kismet.device.base.signal']['kismet.common.signal.last_signal_dbm'];
+        signal = data['kismet.device.base.signal']['kismet.common.signal.last_signal'];
 
         if (signal < lastsignal) {
             sigicon.addClass('k-dsd-arrow-down');
@@ -1636,14 +1791,20 @@ function devsignal_refresh(key, devsignal_panel, devsignal_chart,
             sigicon.show();
         }
 
+        var typestr = "";
+        if (data['kismet.device.base.signal']['kismet.common.signal.type'] == "dbm")
+            typestr = " dBm";
+        else if (data['kismet.device.base.signal']['kismet.common.signal.type'] == "rssi") 
+            typestr = " RSSI";
+
         $('.k-dsd-lastsignal', devsignal_panel.content)
-        .text(signal + " dBm");
+            .text(signal + typestr);
 
         $('.k-dsd-minsignal', devsignal_panel.content)
-        .text(data['kismet.device.base.signal']['kismet.common.signal.min_signal_dbm'] + " dBm");
+        .text(data['kismet.device.base.signal']['kismet.common.signal.min_signal'] + typestr);
 
         $('.k-dsd-maxsignal', devsignal_panel.content)
-        .text(data['kismet.device.base.signal']['kismet.common.signal.max_signal_dbm'] + " dBm");
+        .text(data['kismet.device.base.signal']['kismet.common.signal.max_signal'] + typestr);
 
         // Common point titles
         var pointtitles = new Array();
@@ -1768,12 +1929,26 @@ function devsignal_refresh(key, devsignal_panel, devsignal_chart,
 exports.login_error = false;
 exports.login_pending = false;
 
+exports.ProvisionedPasswordCheck = function(cb) {
+    $.ajax({
+        url: local_uri_prefix + "session/check_setup_ok",
+
+        error: function(jqXHR, textStatus, errorThrown) {
+            cb(jqXHR.status);
+        },
+
+        success: function(data, textStatus, jqHXR) {
+            cb(200);
+        },
+    });
+}
+
 exports.LoginCheck = function(cb, user, pw) {
     user = user || kismet.getStorage('kismet.base.login.username', 'kismet');
-    pw = pw || kismet.getStorage('kismet.base.login.password', 'kismet');
+    pw = pw || kismet.getStorage('kismet.base.login.password', '');
 
     $.ajax({
-        url: "/session/check_login",
+        url: local_uri_prefix + "session/check_login",
 
         beforeSend: function (xhr) {
             xhr.setRequestHeader ("Authorization", "Basic " + btoa(user + ":" + pw));
@@ -1794,56 +1969,67 @@ exports.LoginCheck = function(cb, user, pw) {
     });
 }
 
-exports.FirstLoginCheck = function() {
-    if (kismet.getStorage('kismet.base.warn_login', false) == false) {
-        var loginpanel = null; 
+exports.FirstLoginCheck = function(first_login_done_cb) {
+    var loginpanel = null; 
+    var username_deferred = $.Deferred();
 
-        var content = 
-            $('<div>', {
-                style: 'padding: 10px;'
+    $.get(local_uri_prefix + "system/user_status.json")
+        .done(function(data) {
+            username_deferred.resolve(data['kismet.system.user']);
+        })
+        .fail(function() {
+            username_deferred.resolve("[unknown]");
+        });
+
+    var username = "[incomplete]";
+    $.when(username_deferred).done(function(v) {
+
+    username = v;
+
+    var required_login_content = 
+    $('<div>', {
+        style: 'padding: 10px;'
+    })
+    .append(
+        $('<p>')
+        .html('Kismet requires a login to access data.')
+    )
+    .append(
+        $('<p>')
+        .html('Your login is stored in in <code>.kismet/kismet_httpd.conf</code> in the <i>home directory of the user who launched Kismet</i>;  This server is running as ' + username + ', and the login will be saved in <code>~' + username + '/.kismet/kismet_httpd.conf</code>.')
+    )
+    .append(
+        $('<div>', {
+            id: 'form'
+        })
+        .append(
+            $('<fieldset>', {
+                id: 'fs_login'
             })
             .append(
-                $('<h3>', { }
-                )
-                .append(
-                    $('<i>', {
-                        class: 'fa fa-exclamation-triangle',
-                        style: 'color: red; padding-right: 5px;'
-                    })
-                )
-                .append("Error")
+                $('<span style="display: inline-block; width: 8em;">')
+                .html('User name: ')
             )
             .append(
-                $('<p>')
-                .html('Invalid admin login for the Kismet webserver.  To perform some functions (such as starting or stopping data sources, downloading captures, or changing server-side settings), you must be logged into Kismet.')
-            )
-            .append(
-                $('<p>')
-                .html('The kismet login is randomly generated the first time Kismet is launched, and is stored in <code>~/.kismet/kismet_httpd.conf</code> in the <i>home directory of the user who launched Kismet</i>; If you are a guest on this server, you can continue to view much of the information without logging in but you will not be able to change configurations')
-            )
-            .append(
-                $('<form>', {
-                    id: 'form'
+                $('<input>', {
+                    type: 'text',
+                    name: 'user',
+                    id: 'req_user'
                 })
-                .append(
-                    $('<div>', {
-                        style: 'float: right;',
-                    })
-                    .append(
-                        $('<input>', {
-                            type: 'checkbox',
-                            id: 'dontwarn',
-                            name: 'dontwarn',
-                            value: '',
-                        })
-                    )
-                    .append(
-                        $('<label>', {
-                            for: 'dontwarn',
-                        })
-                        .html('Don\'t warn again')
-                    )
-                )
+            )
+            .append(
+                $('<br>')
+            )
+            .append(
+                $('<span style="display: inline-block; width: 8em;">')
+                .html('Password: ')
+            )
+            .append(
+                $('<input>', {
+                    type: 'password',
+                    name: 'password',
+                    id: 'req_password'
+                })
             )
             .append(
                 $('<div>', {
@@ -1852,59 +2038,322 @@ exports.FirstLoginCheck = function() {
                 .append(
                     $('<button>', {
                         class: 'k-wl-button-close',
+                        id: 'login_button',
                     })
-                    .text('Continue')
+                    .text('Log in')
                     .button()
-                    .on('click', function() {
-                        loginpanel.close();               
-                    })
                 )
                 .append(
-                    $('<button>', {
-                        class: 'k-wl-button-settings',
-                        style: 'position: absolute; right: 5px;',
+                    $('<span>', {
+                        id: 'pwsuccessdiv',
+                        style: 'padding-left: 5px',
                     })
-                    .text('Settings')
-                    .button()
-                    .on('click', function() {
-                        loginpanel.close();               
-                        kismet_ui_settings.ShowSettings('base_login_password');
-                    })
+                    .append(
+                        $('<i>', {
+                            id: 'pwsuccess',
+                            class: 'fa fa-refresh fa-spin',
+                        })
+                    )
+                    .append(
+                        $('<span>', {
+                            id: 'pwsuccesstext'
+                        })
+                    )
+                    .hide()
                 )
-            );
+            )
+        )
+    );
 
-        $('#dontwarn', content)
-            .checkboxradio()
-            .on('change', function() {
-                kismet.putStorage('kismet.base.warn_login', $(this).is(':checked'));
-            });
+    var login_checker_cb = function(content) {
+        var savebutton = $('#login_button', content);
 
+        var checkerdiv = $('#pwsuccessdiv', content);
+        var checker = $('#pwsuccess', checkerdiv);
+        var checkertext = $('#pwsuccesstext', checkerdiv);
 
-        var w = ($(window).width() / 2) - 5;
-        if (w < 450) {
-            w = $(window).width() - 5;
-        }
+        checker.removeClass('fa-exclamation-circle');
+        checker.removeClass('fa-check-square');
+
+        checker.addClass('fa-spin');
+        checker.addClass('fa-refresh');
+        checkertext.text("  Checking...");
+
+        checkerdiv.show();
 
         exports.LoginCheck(function(success) {
             if (!success) {
-                loginpanel = $.jsPanel({
-                    id: "login-alert",
-                    headerTitle: '<i class="fa fa-exclamation-triangle"></i> Login Error',
-                    headerControls: {
-                        controls: 'closeonly',
-                        iconfont: 'jsglyph',
-                    },
-                    contentSize: w + " auto",
-                    paneltype: 'modal',
-                    content: content,
-                });
+                checker.removeClass('fa-check-square');
+                checker.removeClass('fa-spin');
+                checker.removeClass('fa-refresh');
+                checker.addClass('fa-exclamation-circle');
+                checkertext.text("  Invalid login");
+            } else {
+                /* Save the login info */
+                kismet.putStorage('kismet.base.login.username', $('#req_user', content).val());
+                kismet.putStorage('kismet.base.login.password', $('#req_password', content).val());
 
-                return true;
+                loginpanel.close();
+
+                /* Call the primary callback */
+                first_login_done_cb();
             }
+        }, $('#req_user', content).val(), $('#req_password', content).val());
+    };
+
+    $('#login_button', required_login_content)
+        .button()
+        .on('click', function() {
+            login_checker_cb(required_login_content);
         });
 
+    $('fs_login', required_login_content).controlgroup();
+
+    var set_password_content = 
+    $('<div>', {
+        style: 'padding: 10px;'
+    })
+    .append(
+        $('<p>')
+        .html('To finish setting up Kismet, you need to configure a login.')
+    )
+    .append(
+        $('<p>')
+        .html('This login will be stored in <code>.kismet/kismet_httpd.conf</code> in the <i>home directory of the user who launched Kismet</i>;  This server is running as ' + username + ', and the login will be saved in <code>~' + username + '/.kismet/kismet_httpd.conf</code>.')
+    )
+    .append(
+        $('<div>', {
+            id: 'form'
+        })
+        .append(
+            $('<fieldset>', {
+                id: 'fs_login'
+            })
+            .append(
+                $('<legend>', {})
+                .html('Set Login')
+            )
+            .append(
+                $('<span style="display: inline-block; width: 8em;">')
+                .html('User name: ')
+            )
+            .append(
+                $('<input>', {
+                    type: 'text',
+                    name: 'user',
+                    id: 'user'
+                })
+            )
+            .append(
+                $('<br>')
+            )
+            .append(
+                $('<span style="display: inline-block; width: 8em;">')
+                .html('Password: ')
+            )
+            .append(
+                $('<input>', {
+                    type: 'password',
+                    name: 'password',
+                    id: 'password'
+                })
+            )
+            .append(
+                $('<br>')
+            )
+            .append(
+                $('<span style="display: inline-block; width: 8em;">')
+                .html('Confirm: ')
+            )
+            .append(
+                $('<input>', {
+                    type: 'password',
+                    name: 'password2',
+                    id: 'password2'
+                })
+            )
+            .append(
+                $('<span>', {
+                    id: 'pwsuccessdiv',
+                    style: 'padding-left: 5px',
+                })
+                .append(
+                    $('<i>', {
+                        id: 'pwsuccess',
+                        class: 'fa fa-refresh fa-spin',
+                    })
+                )
+                .append(
+                    $('<span>', {
+                        id: 'pwsuccesstext'
+                    })
+                )
+                .hide()
+            )
+        )
+    )
+    .append(
+        $('<div>', {
+            style: 'padding-top: 10px;'
+        })
+        .append(
+            $('<button>', {
+                class: 'k-wl-button-close',
+                id: 'save_password',
+            })
+            .text('Save')
+            .button()
+        )
+    );
+
+    var checker_cb = function(content) {
+        var savebutton = $('#save_password', content);
+        var checkerdiv = $('#pwsuccessdiv', content);
+        var checker = $('#pwsuccess', checkerdiv);
+        var checkertext = $('#pwsuccesstext', checkerdiv);
+
+        savebutton.button("disable");
+
+        checker.removeClass('fa-exclamation-circle');
+        checker.removeClass('fa-check-square');
+
+        checker.addClass('fa-spin');
+        checker.addClass('fa-refresh');
+        checkertext.text("");
+
+        checkerdiv.show();
+
+        if ($('#user', content).val().length == 0) {
+            checker.removeClass('fa-check-square');
+            checker.removeClass('fa-spin');
+            checker.removeClass('fa-refresh');
+            checker.addClass('fa-exclamation-circle');
+            checkertext.text("  Username required");
+            savebutton.button("disable");
+            return;
+        }
+
+        if ($('#password', content).val().length == 0) {
+            checker.removeClass('fa-check-square');
+            checker.removeClass('fa-spin');
+            checker.removeClass('fa-refresh');
+            checker.addClass('fa-exclamation-circle');
+            checkertext.text("  Password required");
+            savebutton.button("disable");
+            return;
+        }
+
+        if ($('#password', content).val() != $('#password2', content).val()) {
+            checker.removeClass('fa-check-square');
+            checker.removeClass('fa-spin');
+            checker.removeClass('fa-refresh');
+            checker.addClass('fa-exclamation-circle');
+            checkertext.text("  Passwords don't match");
+            savebutton.button("disable");
+            return;
+        }
+
+        checker.removeClass('fa-exclamation-circle');
+        checker.removeClass('fa-spin');
+        checker.removeClass('fa-refresh');
+        checker.addClass('fa-check-square');
+        checkertext.text("");
+        savebutton.button("enable");
+
+    };
+
+    jQuery('#user', set_password_content).on('input propertychange paste', function() {
+        checker_cb();
+    });
+    jQuery('#password', set_password_content).on('input propertychange paste', function() {
+        checker_cb();
+    });
+    jQuery('#password2', set_password_content).on('input propertychange paste', function() {
+        checker_cb();
+    });
+
+    $('#save_password', set_password_content)
+        .button()
+        .on('click', function() {
+            kismet.putStorage('kismet.base.login.username', $('#user', set_password_content).val());
+            kismet.putStorage('kismet.base.login.password', $('#password', set_password_content).val());
+
+            var postdata = {
+                "username": $('#user', set_password_content).val(),
+                "password": $('#password', set_password_content).val()
+            };
+
+            $.ajax({
+                type: "POST",
+                url: local_uri_prefix + "session/set_password",
+                data: postdata,
+                error: function(jqXHR, textStatus, errorThrown) {
+                    alert("Could not set login, check your kismet server logs.")
+                },
+            });
+
+            loginpanel.close();
+
+            /* Call the primary callback to load the UI */
+            first_login_done_cb();
+
+            /* Check for the first-time running */
+            exports.FirstTimeCheck();
+        });
+
+    $('fs_login', set_password_content).controlgroup();
+
+    checker_cb(set_password_content);
+
+    var w = ($(window).width() / 2) - 5;
+    if (w < 450) {
+        w = $(window).width() - 5;
     }
 
+    var content = set_password_content;
+
+    exports.ProvisionedPasswordCheck(function(code) {
+        if (code == 200 || code == 406) {
+            /* Initial setup has been complete, now check the login itself */
+            exports.LoginCheck(function(success) {
+                if (!success) {
+                    loginpanel = $.jsPanel({
+                        id: "login-alert",
+                        headerTitle: '<i class="fa fa-exclamation-triangle"></i>Login Required',
+                        headerControls: {
+                            controls: 'closeonly',
+                            iconfont: 'jsglyph',
+                        },
+                        contentSize: w + " auto",
+                        paneltype: 'modal',
+                        content: required_login_content,
+                    });
+
+                    return true;
+                } else {
+                    /* Otherwise we're all good, continue to loading the main UI via the callback */
+                    first_login_done_cb();
+                }
+            });
+        } else if (code != 200) {
+            loginpanel = $.jsPanel({
+                id: "login-alert",
+                headerTitle: '<i class="fa fa-exclamation-triangle"></i> Set Login',
+                headerControls: {
+                    controls: 'closeonly',
+                    iconfont: 'jsglyph',
+                },
+                contentSize: w + " auto",
+                paneltype: 'modal',
+                content: set_password_content,
+            });
+
+            return true;
+        }
+   });
+
+   // When clause
+   });
 }
 
 exports.FirstTimeCheck = function() {
@@ -1976,6 +2425,21 @@ exports.FirstTimeCheck = function() {
     }
 
     return false;
+}
+
+// Keep trying to fetch the servername until we're able to
+var servername_tid = -1;
+exports.FetchServerName = function(cb) {
+    $.get(local_uri_prefix + "system/status.json")
+        .done(function (d) {
+            d = kismet.sanitizeObject(d);
+            cb(d['kismet.system.server_name']);
+        })
+        .fail(function () {
+            servername_tid = setTimeout(function () {
+                exports.Servername(cb);
+            }, 1000);
+        });
 }
 
 /* Highlight active devices */

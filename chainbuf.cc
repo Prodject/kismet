@@ -19,7 +19,7 @@
 #include "chainbuf.h"
 #include "util.h"
 
-Chainbuf::Chainbuf(size_t in_chunk, size_t pre_allocate) {
+chainbuf::chainbuf(size_t in_chunk, size_t pre_allocate) {
     chunk_sz = in_chunk;
 
     // Allocate slots in the vector, but not bytes
@@ -44,15 +44,15 @@ Chainbuf::Chainbuf(size_t in_chunk, size_t pre_allocate) {
     alloc_delta = 0;
 }
 
-Chainbuf::~Chainbuf() {
-    local_eol_locker lock(&write_mutex);
+chainbuf::~chainbuf() {
+    local_locker lock(&write_mutex);
 
-    // fprintf(stderr, "debug - freeing chainbuf, total size %lu chunks %lu, largest allocation delta %lu\n", total_sz, (total_sz / chunk_sz) + 1, alloc_delta);
+    // fprintf(stderr, "debug - freeing chainbuf, total size %zu chunks %zu, largest allocation delta %zu\n", total_sz, (total_sz / chunk_sz) + 1, alloc_delta);
 
     clear();
 }
 
-void Chainbuf::clear() {
+void chainbuf::clear() {
     local_locker lock(&write_mutex);
 
     for (auto x : buff_vec) 
@@ -61,19 +61,19 @@ void Chainbuf::clear() {
     buff_vec.clear();
 }
 
-size_t Chainbuf::used() {
+size_t chainbuf::used() {
     local_locker lock(&write_mutex);
 
     return used_sz;
 }
 
-size_t Chainbuf::total() {
+size_t chainbuf::total() {
     local_locker lock(&write_mutex);
 
     return total_sz;
 }
 
-ssize_t Chainbuf::write(uint8_t *in_data, size_t in_sz) {
+ssize_t chainbuf::write(uint8_t *in_data, size_t in_sz) {
     local_locker lock(&write_mutex);
 
     size_t total_written = 0;
@@ -85,15 +85,12 @@ ssize_t Chainbuf::write(uint8_t *in_data, size_t in_sz) {
         // Whole buffer or whole chunk
         size_t w_sz = std::min(in_sz - total_written, free_chunk_sz);
 
-        // fprintf(stderr, "debug - chainbuf - in_sz %lu free in block %lu total written %lu\n", in_sz, free_chunk_sz, total_written);
-
-        // fprintf(stderr, "debug - w_sz %lu block %p\n", w_sz, buff_vec[write_block]);
-
         if (in_data != NULL) {
             if (w_sz == 1)
                 write_buf[write_offt] = in_data[total_written];
-            else
+            else {
                 memcpy(write_buf + write_offt, in_data + total_written, w_sz);
+            }
         }
 
         write_offt += w_sz;
@@ -110,6 +107,8 @@ ssize_t Chainbuf::write(uint8_t *in_data, size_t in_sz) {
             write_block++;
             write_buf = buff_vec[write_block];
 
+            // fprintf(stderr, "debug - allocated new chunk %u\n", write_block);
+
             if (read_buf == NULL) {
                 read_buf = buff_vec[read_block];
             }
@@ -125,7 +124,7 @@ ssize_t Chainbuf::write(uint8_t *in_data, size_t in_sz) {
     return total_written;
 }
 
-ssize_t Chainbuf::peek(uint8_t **ret_data, size_t in_sz) {
+ssize_t chainbuf::peek(uint8_t **ret_data, size_t in_sz) {
     local_eol_locker peeklock(&write_mutex);
 
     if (peek_reserved) {
@@ -143,7 +142,7 @@ ssize_t Chainbuf::peek(uint8_t **ret_data, size_t in_sz) {
     size_t goal_sz = std::min(used(), in_sz);
 
     // If we're contiguous 
-    if (read_offt + goal_sz <= chunk_sz) {
+    if (read_offt + goal_sz < chunk_sz) {
         free_read = false;
         peek_reserved = true;
 
@@ -185,7 +184,7 @@ ssize_t Chainbuf::peek(uint8_t **ret_data, size_t in_sz) {
     return goal_sz;
 }
 
-ssize_t Chainbuf::zero_copy_peek(uint8_t **ret_data, size_t in_sz) {
+ssize_t chainbuf::zero_copy_peek(uint8_t **ret_data, size_t in_sz) {
     local_eol_locker peeklock(&write_mutex);
 
     if (peek_reserved) {
@@ -202,7 +201,7 @@ ssize_t Chainbuf::zero_copy_peek(uint8_t **ret_data, size_t in_sz) {
     }
 
     if (read_buf == NULL) {
-        fprintf(stderr, "read in null at block %u used %lu\n", read_block, used());
+        fprintf(stderr, "read in null at block %u used %zu\n", read_block, used());
         throw std::runtime_error("chainbuf advanced into null readbuf");
     }
 
@@ -221,7 +220,7 @@ ssize_t Chainbuf::zero_copy_peek(uint8_t **ret_data, size_t in_sz) {
     return goal_sz;
 }
 
-void Chainbuf::peek_free(unsigned char *in_data) {
+void chainbuf::peek_free(unsigned char *in_data) {
     local_unlocker unpeeklock(&write_mutex);
 
     if (!peek_reserved) {
@@ -236,7 +235,7 @@ void Chainbuf::peek_free(unsigned char *in_data) {
     free_read = false;
 }
 
-size_t Chainbuf::consume(size_t in_sz) {
+size_t chainbuf::consume(size_t in_sz) {
     // Protect against crossthread
     local_locker writelock(&write_mutex);
 
@@ -268,10 +267,12 @@ size_t Chainbuf::consume(size_t in_sz) {
         // Jump the read offset
         read_offt += rd_sz;
 
-        // fprintf(stderr, "debug - chainbuf - consumed, read_offt %lu\n", read_offt);
+        // fprintf(stderr, "debug - chainbuf - consumed, read_offt %zu\n", read_offt);
 
         // We've jumped to the next block...
         if (read_offt >= chunk_sz) {
+            // fprintf(stderr, "debug - read consumed %u, deleting\n", read_block);
+
             // Universal read offt jumps
             read_offt = 0;
 
@@ -296,12 +297,12 @@ size_t Chainbuf::consume(size_t in_sz) {
 
     }
 
-    // fprintf(stderr, "debug - chainbuf - consumed %lu used %lu\n", consumed_sz, used_sz);
+    // fprintf(stderr, "debug - chainbuf - consumed %zu used %zu\n", consumed_sz, used_sz);
     used_sz -= consumed_sz;
     return consumed_sz;
 }
 
-ssize_t Chainbuf::reserve(unsigned char **data, size_t in_sz) {
+ssize_t chainbuf::reserve(unsigned char **data, size_t in_sz) {
     local_eol_locker writelock(&write_mutex);
 
     if (write_reserved) {
@@ -321,12 +322,12 @@ ssize_t Chainbuf::reserve(unsigned char **data, size_t in_sz) {
     return in_sz;
 }
 
-ssize_t Chainbuf::zero_copy_reserve(unsigned char **data, size_t in_sz) {
+ssize_t chainbuf::zero_copy_reserve(unsigned char **data, size_t in_sz) {
     // We can't do better than our zero copy attempt
     return reserve(data, in_sz);
 }
 
-bool Chainbuf::commit(unsigned char *data, size_t in_sz) {
+bool chainbuf::commit(unsigned char *data, size_t in_sz) {
     local_unlocker unwritelock(&write_mutex);
 
     if (!write_reserved) {

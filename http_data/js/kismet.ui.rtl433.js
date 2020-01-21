@@ -132,13 +132,74 @@ kismet_ui.AddDeviceDetail("rtl433", "RTL-433 (SDR)", 0, {
                 },
                 ]
             },
+            {
+                field: "rtl433.device/rtl433.device.tpms",
+                groupTitle: "Tire pressure",
+                id: "group_tpms_data",
+                filterOnEmpty: true,
+                fields: [
+                {
+                    field: "rtl433.device/rtl433.device.tpms/rtl433.device.tpms.pressure_bar",
+                    title: "Pressure",
+                    filterOnZero: true,
+                    render: function(opts) {
+                        return opts['value'] + " bar";
+                    },
+                    help: "Reported TPMS pressure in bars",
+                },
+                {
+                    field: "rtl433.device/rtl433.device.tpms/rtl433.device.tpms.pressure_kpa",
+                    title: "Pressure",
+                    filterOnZero: true,
+                    render: function(opts) {
+                        return opts['value'] + " kPa";
+                    },
+                    help: "Reported TPMS pressure in kPa",
+                },
+                ]
+            },
+            {
+                field: "rtl433.device/rtl433.device.lightningsensor",
+                groupTitle: "Lightning Sensor",
+                id: "group_lightning_data",
+                filterOnEmpty: true,
+                fields: [
+                {
+                    field: "rtl433.device/rtl433.device.lightningsensor/rtl433.device.lightning_strike_count",
+                    title: "Strike Count",
+                    filterOnEmpty: true,
+                    help: "Last reported lighting strike count (may reset arbitrarily)"
+                },
+                {
+                    field: "rtl433.device/rtl433.device.lightningsensor/rtl433.device.lightning_storm_active",
+                    title: "Storm Active",
+                    filterOnEmpty: true,
+                    help: "Storm currently active",
+                    render: function(opts) {
+                        if (opts['value'])
+                            return "Active";
+                        return "Inactive";
+                    }
+                },
+                {
+                    field: "rtl433.device/rtl433.device.lightningsensor/rtl433.device.lightning_rfi",
+                    title: "RFI",
+                    filterOnEmpty: true,
+                    help: "Radio Frequency Interference from lightning activity"
+                },
+                {
+                    field: "rtl433.device/rtl433.device.lightningsensor/rtl433.device.lightning_storm_distance",
+                    title: "Storm distance",
+                    filterOnEmpty: true,
+                    help: "Estimated storm distance (no distance units provided)"
+                },
+                ]
+            },
 
             ],
         });
     },
 });
-
-console.log("kismet.ui.rtl433.js returning, we think we loaded everything?");
 
 // We're done loading
 exports.load_complete = 1;

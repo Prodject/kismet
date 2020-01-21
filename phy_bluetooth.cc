@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -33,49 +33,48 @@
 #include "phy_bluetooth.h"
 #include "kis_httpd_registry.h"
 #include "devicetracker.h"
+#include "alertracker.h"
 
-Kis_Bluetooth_Phy::Kis_Bluetooth_Phy(GlobalRegistry *in_globalreg, Devicetracker *in_tracker,
-        int in_phyid) : Kis_Phy_Handler(in_globalreg, in_tracker, in_phyid) {
-    globalreg = in_globalreg;
+Kis_Bluetooth_Phy::Kis_Bluetooth_Phy(global_registry *in_globalreg, int in_phyid) : 
+    kis_phy_handler(in_globalreg, in_phyid) {
 
     alertracker = 
-        Globalreg::FetchGlobalAs<Alertracker>(globalreg, "ALERTTRACKER");
+        Globalreg::fetch_mandatory_global_as<alert_tracker>();
     packetchain = 
-        Globalreg::FetchGlobalAs<Packetchain>(globalreg, "PACKETCHAIN");
+        Globalreg::fetch_mandatory_global_as<packet_chain>();
     entrytracker = 
-        Globalreg::FetchGlobalAs<EntryTracker>(globalreg, "ENTRY_TRACKER");
-    devicetracker = 
-        Globalreg::FetchGlobalAs<Devicetracker>(globalreg, "DEVICE_TRACKER");
+        Globalreg::fetch_mandatory_global_as<entry_tracker>();
+    devicetracker =
+        Globalreg::fetch_mandatory_global_as<device_tracker>();
 
-    SetPhyName("Bluetooth");
+    set_phy_name("Bluetooth");
 
     bluetooth_device_entry_id =
-        entrytracker->RegisterField("bluetooth.device", 
-                std::shared_ptr<bluetooth_tracked_device>(new bluetooth_tracked_device(globalreg, 0)),
+        entrytracker->register_field("bluetooth.device", 
+                tracker_element_factory<bluetooth_tracked_device>(),
                 "Bluetooth device");
 
-    packetchain->RegisterHandler(&CommonClassifierBluetooth, this, CHAINPOS_CLASSIFIER, -100);
-    packetchain->RegisterHandler(&PacketTrackerBluetooth, this, CHAINPOS_TRACKER, -100);
+    packetchain->register_handler(&CommonClassifierBluetooth, this, CHAINPOS_CLASSIFIER, -100);
+    packetchain->register_handler(&PacketTrackerBluetooth, this, CHAINPOS_TRACKER, -100);
     
-    pack_comp_btdevice = packetchain->RegisterPacketComponent("BTDEVICE");
-	pack_comp_common = packetchain->RegisterPacketComponent("COMMON");
-    pack_comp_l1info = packetchain->RegisterPacketComponent("RADIODATA");
+    pack_comp_btdevice = packetchain->register_packet_component("BTDEVICE");
+	pack_comp_common = packetchain->register_packet_component("COMMON");
+    pack_comp_l1info = packetchain->register_packet_component("RADIODATA");
+    pack_comp_meta = packetchain->register_packet_component("METABLOB");
 
     // Register js module for UI
-    std::shared_ptr<Kis_Httpd_Registry> httpregistry = 
-        Globalreg::FetchGlobalAs<Kis_Httpd_Registry>(globalreg, "WEBREGISTRY");
+    auto httpregistry = 
+        Globalreg::fetch_mandatory_global_as<kis_httpd_registry>();
     httpregistry->register_js_module("kismet_ui_bluetooth", 
-            "/js/kismet.ui.bluetooth.js");
+            "js/kismet.ui.bluetooth.js");
 }
 
 Kis_Bluetooth_Phy::~Kis_Bluetooth_Phy() {
-    packetchain->RemoveHandler(&CommonClassifierBluetooth, CHAINPOS_CLASSIFIER);
+    packetchain->remove_handler(&CommonClassifierBluetooth, CHAINPOS_CLASSIFIER);
 }
 
 int Kis_Bluetooth_Phy::CommonClassifierBluetooth(CHAINCALL_PARMS) {
-    Kis_Bluetooth_Phy *btphy = (Kis_Bluetooth_Phy *) auxdata;
-
-    devicelist_scope_locker listlock(btphy->devicetracker);
+    auto btphy = static_cast<Kis_Bluetooth_Phy *>(auxdata);
 
     bluetooth_packinfo *btpi = 
         (bluetooth_packinfo *) in_pack->fetch(btphy->pack_comp_btdevice);
@@ -91,7 +90,7 @@ int Kis_Bluetooth_Phy::CommonClassifierBluetooth(CHAINCALL_PARMS) {
         in_pack->insert(btphy->pack_comp_common, ci);
     }
 
-    ci->phyid = btphy->FetchPhyId();
+    ci->phyid = btphy->fetch_phy_id();
     ci->type = packet_basic_mgmt;
     ci->source = btpi->address;
     ci->transmitter = btpi->address;
@@ -116,26 +115,31 @@ int Kis_Bluetooth_Phy::PacketTrackerBluetooth(CHAINCALL_PARMS) {
         return 0;
 
     std::shared_ptr<kis_tracked_device_base> basedev =
-        btphy->devicetracker->UpdateCommonDevice(ci, ci->source, btphy, in_pack, 
+        btphy->devicetracker->update_common_device(ci, ci->source, btphy, in_pack, 
                 (UCD_UPDATE_SIGNAL | UCD_UPDATE_FREQUENCIES |
                  UCD_UPDATE_PACKETS | UCD_UPDATE_LOCATION |
-                 UCD_UPDATE_SEENBY | UCD_UPDATE_ENCRYPTION));
+                 UCD_UPDATE_SEENBY | UCD_UPDATE_ENCRYPTION),
+                "Bluetooth");
 
-    if (basedev == NULL)
+    if (basedev == nullptr)
         return 0;
 
-    std::shared_ptr<bluetooth_tracked_device> btdev =
-        std::static_pointer_cast<bluetooth_tracked_device>(basedev->get_map_value(btphy->bluetooth_device_entry_id));
+    local_locker bssidlock(&(basedev->device_mutex));
 
-    if (btdev == NULL) {
+    auto btdev =
+        basedev->get_sub_as<bluetooth_tracked_device>(btphy->bluetooth_device_entry_id);
+
+    if (btdev == nullptr) {
         std::stringstream ss;
-        ss << "Detected new Bluetooth device " << btpi->address.Mac2String();
+        ss << "Detected new Bluetooth device " << btpi->address.mac_to_string();
         if (btpi->name.length() > 0) 
             ss << " (" << btpi->name << ")";
         _MSG(ss.str(), MSGFLAG_INFO);
 
-        btdev.reset(new bluetooth_tracked_device(globalreg, btphy->bluetooth_device_entry_id));
-        basedev->add_map(btdev);
+        btdev =
+            std::make_shared<bluetooth_tracked_device>(btphy->bluetooth_device_entry_id);
+
+        basedev->insert(btdev);
     }
 
     basedev->bitset_basic_type_set(KIS_DEVICE_BASICTYPE_PEER);
@@ -153,39 +157,42 @@ int Kis_Bluetooth_Phy::PacketTrackerBluetooth(CHAINCALL_PARMS) {
     if (btpi->name.length() > 0)
         basedev->set_devicename(btpi->name);
     else if (basedev->get_devicename().length() == 0) {
-        basedev->set_devicename(basedev->get_macaddr().Mac2String());
+        basedev->set_devicename(basedev->get_macaddr().mac_to_string());
     }
 
     // Set the new tx power
     btdev->set_txpower(btpi->txpower);
 
     // Reset the service UUID vector
-    TrackerElementVector sv(btdev->get_tracker_service_uuid_vec());
-    sv.clear();
+    auto uuid_vec = btdev->get_service_uuid_vec();
+
+    uuid_vec->clear();
 
     for (auto u : btpi->service_uuid_vec) {
-        SharedTrackerElement tu(new TrackerElement(TrackerUuid));
-        tu->set(u);
-
-        sv.push_back(tu);
+        auto tu = std::make_shared<tracker_element_uuid>(0, u);
+        uuid_vec->push_back(tu);
     }
 
     return 0;
 }
 
-void Kis_Bluetooth_Phy::LoadPhyStorage(SharedTrackerElement in_storage, 
-        SharedTrackerElement in_device) {
+void Kis_Bluetooth_Phy::load_phy_storage(shared_tracker_element in_storage, 
+        shared_tracker_element in_device) {
 
-    if (in_storage == NULL || in_device == NULL)
+    if (in_storage == nullptr || in_device == nullptr)
         return;
 
+    auto storage = std::static_pointer_cast<tracker_element_map>(in_storage);
+
     // Does the imported record have bt?
-    auto btdevi = in_storage->find(bluetooth_device_entry_id);
+    auto btdevi = storage->find(bluetooth_device_entry_id);
 
     // Adopt it into a dot11
-    if (btdevi != in_storage->end()) {
-        std::shared_ptr<bluetooth_tracked_device> btdev(new bluetooth_tracked_device(globalreg, bluetooth_device_entry_id, btdevi->second));
-        in_device->add_map(btdev);
+    if (btdevi != storage->end()) {
+        auto btdev = 
+            std::make_shared<bluetooth_tracked_device>(bluetooth_device_entry_id, 
+                    std::static_pointer_cast<tracker_element_map>(btdevi->second));
+        std::static_pointer_cast<tracker_element_map>(in_device)->insert(btdev);
     }
 }
 

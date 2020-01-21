@@ -40,72 +40,88 @@
 
 class zwave_tracked_device : public tracker_component {
 public:
-    zwave_tracked_device(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
-            register_fields();
-            reserve_fields(NULL);
-        }
-
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new zwave_tracked_device(globalreg, get_id()));
+    zwave_tracked_device() :
+        tracker_component() {
+        register_fields();
+        reserve_fields(NULL);
     }
 
-    zwave_tracked_device(GlobalRegistry *in_globalreg, int in_id,
-            SharedTrackerElement e) :
-        tracker_component(in_globalreg, in_id) {
+    zwave_tracked_device(int in_id) :
+        tracker_component(in_id) {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    zwave_tracked_device(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
         register_fields();
         reserve_fields(e);
+    }
+
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("zwave_tracked_device");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
     }
 
     __Proxy(homeid, uint32_t, uint32_t, uint32_t, homeid);
     __Proxy(deviceid, uint8_t, uint8_t, uint8_t, deviceid);
 
 protected:
-    virtual void register_fields() {
+    virtual void register_fields() override {
         tracker_component::register_fields();
 
-        RegisterField("zwave.device.home_id", TrackerUInt32,
-                "Z-Wave network Home ID packed as U32", &homeid);
-        RegisterField("zwave.device.device_id", TrackerUInt8,
-                "Z-Wave network device ID", &deviceid);
+        register_field("zwave.device.home_id", "Z-Wave network Home ID packed as U32", &homeid);
+        register_field("zwave.device.device_id", "Z-Wave network device ID", &deviceid);
     }
 
     // 4-byte homeid
-    SharedTrackerElement homeid;
+    std::shared_ptr<tracker_element_uint32> homeid;
     // 1 byte device id
-    SharedTrackerElement deviceid;
+    std::shared_ptr<tracker_element_uint8> deviceid;
 };
 
-class Kis_Zwave_Phy : public Kis_Phy_Handler, public Kis_Net_Httpd_CPPStream_Handler {
+class Kis_Zwave_Phy : public kis_phy_handler, public kis_net_httpd_cppstream_handler {
 public:
     virtual ~Kis_Zwave_Phy();
 
-    Kis_Zwave_Phy(GlobalRegistry *in_globalreg) :
-        Kis_Phy_Handler(in_globalreg) { };
+    Kis_Zwave_Phy(global_registry *in_globalreg) :
+        kis_phy_handler(in_globalreg),
+        kis_net_httpd_cppstream_handler() { 
+            bind_httpd_server();
+        };
 
 	// Build a strong version of ourselves
-	virtual Kis_Phy_Handler *CreatePhyHandler(GlobalRegistry *in_globalreg,
-											  Devicetracker *in_tracker,
-											  int in_phyid) {
-		return new Kis_Zwave_Phy(in_globalreg, in_tracker, in_phyid);
+	virtual kis_phy_handler *create_phy_handler(global_registry *in_globalreg, int in_phyid) {
+		return new Kis_Zwave_Phy(in_globalreg, in_phyid);
 	}
 
-    Kis_Zwave_Phy(GlobalRegistry *in_globalreg, Devicetracker *in_tracker,
-            int in_phyid);
+    Kis_Zwave_Phy(global_registry *in_globalreg, int in_phyid);
 
     // HTTPD API
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
+    virtual bool httpd_verify_path(const char *path, const char *method);
 
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+    virtual void httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
             size_t *upload_data_size, std::stringstream &stream);
 
-    virtual int Httpd_PostComplete(Kis_Net_Httpd_Connection *concls);
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls);
 
 protected:
-    std::shared_ptr<Packetchain> packetchain;
-    std::shared_ptr<EntryTracker> entrytracker;
+    std::shared_ptr<packet_chain> packetchain;
+    std::shared_ptr<entry_tracker> entrytracker;
+    std::shared_ptr<device_tracker> devicetracker;
 
     int zwave_device_id;
 
@@ -116,6 +132,8 @@ protected:
     // convert to a device record & push into device tracker, return false
     // if we can't do anything with it
     bool json_to_record(Json::Value in_json);
+
+    std::shared_ptr<tracker_element_string> zwave_manuf;
 
 };
 

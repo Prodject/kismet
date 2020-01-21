@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -32,14 +32,24 @@
 #define DLT_IEEE802_11_RADIO 127
 #endif
 
-class Kis_DLT_Radiotap : public Kis_DLT_Handler {
+class kis_dlt_radiotap : public kis_dlt_handler {
 public:
-	Kis_DLT_Radiotap() { fprintf(stderr, "FATAL OOPS: Kis_DLT_Radiotap()\n"); exit(1); }
-	Kis_DLT_Radiotap(GlobalRegistry *in_globalreg);
+    static std::string global_name() { return "DLT_RADIOTAP"; }
 
-	virtual int HandlePacket(kis_packet *in_pack);
+    static std::shared_ptr<kis_dlt_radiotap> create_dlt() {
+        std::shared_ptr<kis_dlt_radiotap> mon(new kis_dlt_radiotap());
+        Globalreg::globalreg->register_lifetime_global(mon);
+        Globalreg::globalreg->insert_global(global_name(), mon);
+        return mon;
+    }
 
-	~Kis_DLT_Radiotap();
+private:
+	kis_dlt_radiotap();
+
+public:
+	virtual ~kis_dlt_radiotap() { };
+
+	virtual int handle_packet(kis_packet *in_pack);
 
 protected:
     unsigned int update_crc32_80211(unsigned int crc, const unsigned char *data,

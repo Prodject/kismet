@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -48,29 +48,28 @@ extern "C" {
 // called with allocate should be the amount of space it will use, while the 
 // return value for non-allocate should indicate the new position (absolute new
 // position, not offset!)
-#define DUMPFILE_PPI_PARMS	GlobalRegistry *in_globalreg, int in_allocate, \
-	kis_packet *in_pack, uint8_t *dump_data, int dump_pos, void *aux
+#define DUMPFILE_PPI_PARMS	int in_allocate, kis_packet *in_pack, uint8_t *dump_data, \
+    int dump_pos, void *aux
 typedef int (*dumpfile_ppi_cb)(DUMPFILE_PPI_PARMS);
 
 // Filter to return a packet type for logging (used for derivative pcap loggers,
 // like in plugins)
-#define DUMPFILE_PCAP_FILTER_PARMS	GlobalRegistry *in_globalreg, kis_packet *in_pack, \
-	void *aux
+#define DUMPFILE_PCAP_FILTER_PARMS	kis_packet *in_pack, void *aux
 typedef kis_datachunk *(*dumpfile_pcap_filter_cb)(DUMPFILE_PCAP_FILTER_PARMS);
 
 // Pcap-based packet writer
-class KisPPILogfile : public KisLogfile {
+class kis_ppi_logfile : public kis_logfile {
 public:
-    KisPPILogfile(GlobalRegistry *in_globalreg, SharedLogBuilder in_builder);
-    virtual ~KisPPILogfile();
+    kis_ppi_logfile(shared_log_builder in_builder);
+    virtual ~kis_ppi_logfile();
 
 	static int packet_handler(CHAINCALL_PARMS);
 
-	virtual void RegisterPPICallback(dumpfile_ppi_cb in_cb, void *in_aux);
-	virtual void RemovePPICallback(dumpfile_ppi_cb in_cb, void *in_aux);
+	virtual void register_ppi_callback(dumpfile_ppi_cb in_cb, void *in_aux);
+	virtual void remove_ppi_callback(dumpfile_ppi_cb in_cb, void *in_aux);
 
-    virtual bool Log_Open(std::string in_path);
-    virtual void Log_Close();
+    virtual bool open_log(std::string in_path) override;
+    virtual void close_log() override;
 
 	struct ppi_cb_rec {
 		dumpfile_ppi_cb cb;
@@ -79,7 +78,7 @@ public:
 
 protected:
 	// Common internal startup
-	void Startup_Dumpfile();
+	void startup_dumpfile();
 
 	pcap_t *dumpfile;
 	pcap_dumper_t *dumper;
@@ -94,42 +93,42 @@ protected:
 
     int pack_comp_80211, pack_comp_mangleframe, pack_comp_radiodata,
         pack_comp_gps, pack_comp_checksum, pack_comp_decap, pack_comp_linkframe;
+
+    kis_recursive_timed_mutex packet_mutex;
 };
 
-class KisPPILogfileBuilder : public KisLogfileBuilder {
+class ppi_logfile_builder : public kis_logfile_builder {
 public:
-    KisPPILogfileBuilder(GlobalRegistry *in_globalreg, int in_id) :
-        KisLogfileBuilder(in_globalreg, in_id) {
+    ppi_logfile_builder() :
+        kis_logfile_builder() {
+        register_fields();
+        reserve_fields(NULL);
+        initialize();
+    }
+
+    ppi_logfile_builder(int in_id) :
+        kis_logfile_builder(in_id) {
            
         register_fields();
         reserve_fields(NULL);
         initialize();
     }
 
-    KisPPILogfileBuilder(GlobalRegistry *in_globalreg, int in_id,
-            SharedTrackerElement e) :
-        KisLogfileBuilder(in_globalreg, in_id, e) {
+    ppi_logfile_builder(int in_id, std::shared_ptr<tracker_element_map> e) :
+        kis_logfile_builder(in_id, e) {
 
         register_fields();
         reserve_fields(e);
         initialize();
     }
 
-    KisPPILogfileBuilder(GlobalRegistry *in_globalreg) :
-        KisLogfileBuilder(in_globalreg, 0) {
+    virtual ~ppi_logfile_builder() { }
 
-        register_fields();
-        reserve_fields(NULL);
-        initialize();
+    virtual shared_logfile build_logfile(shared_log_builder builder) override {
+        return shared_logfile(new kis_ppi_logfile(builder));
     }
 
-    virtual ~KisPPILogfileBuilder() { }
-
-    virtual SharedLogfile build_logfile(SharedLogBuilder builder) {
-        return SharedLogfile(new KisPPILogfile(globalreg, builder));
-    }
-
-    virtual void initialize() {
+    virtual void initialize() override {
         set_log_class("pcapppi");
         set_log_name("PPI legacy pcap");
         set_stream(true);

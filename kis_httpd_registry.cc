@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -22,38 +22,54 @@
 #include "configfile.h"
 #include "kis_httpd_registry.h"
 
-Kis_Httpd_Registry::Kis_Httpd_Registry(GlobalRegistry *in_globalreg) :
-    Kis_Net_Httpd_CPPStream_Handler(in_globalreg), 
-    LifetimeGlobal() {
+kis_httpd_registry::kis_httpd_registry(global_registry *in_globalreg) :
+    kis_net_httpd_cppstream_handler(), 
+    lifetime_global() {
+    reg_lock.set_name("kis_httpd_registry");
 
     globalreg = in_globalreg;
 
+    bind_httpd_server();
 }
 
-Kis_Httpd_Registry::~Kis_Httpd_Registry() {
-    local_eol_locker lock(&reg_lock);
+kis_httpd_registry::~kis_httpd_registry() {
+    local_locker lock(&reg_lock);
 
 }
 
-bool Kis_Httpd_Registry::register_js_module(std::string in_module, std::string in_path) {
+bool kis_httpd_registry::register_js_module(std::string in_module, std::string in_path) {
     local_locker lock(&reg_lock);
 
     if (js_module_path_map.find(in_module) != js_module_path_map.end()) {
-        _MSG("HTTPD Module Registry: Module '" + in_module + "' already "
-                "registered", MSGFLAG_ERROR);
+        _MSG_ERROR("HTTPD Module Registry: Module '{}' already registered",
+                in_module);
         return false;
     }
 
-    js_module_path_map.emplace(in_module, in_path);
+    // Hack around for re-homing kismet resources; alert on a leading '/' and fix it.
+    if (in_path.length() == 0) {
+        _MSG_ERROR("HTTPD Module Registry: Module {} with no path", in_module);
+        return false;
+    }
+
+    if (in_path[0] == '/') {
+        _MSG_ERROR("HTTPD Module Registry: Module {} starts with a '/', for newer "
+                "Kismet systems this should be a relative path; check that your plugin "
+                "is updated.  Kismet will automatically make this a relative path.",
+                in_module);
+        in_path = in_path.substr(1, in_path.length());
+    }
+
+    js_module_path_map[in_module] = in_path;
 
     return true;
 }
 
-bool Kis_Httpd_Registry::Httpd_VerifyPath(const char *path, const char *method) {
+bool kis_httpd_registry::httpd_verify_path(const char *path, const char *method) {
     if (strcmp(method, "GET") != 0)
         return false;
 
-    if (!Httpd_CanSerialize(path))
+    if (!httpd_can_serialize(path))
         return false;
 
     if (strcmp(path, "/dynamic.json") == 0)
@@ -62,8 +78,8 @@ bool Kis_Httpd_Registry::Httpd_VerifyPath(const char *path, const char *method) 
     return false;
 }
 
-void Kis_Httpd_Registry::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-        Kis_Net_Httpd_Connection *connection,
+void kis_httpd_registry::httpd_create_stream_response(kis_net_httpd *httpd,
+        kis_net_httpd_connection *connection,
         const char *path, const char *method, const char *upload_data,
         size_t *upload_data_size, std::stringstream &stream) {
 

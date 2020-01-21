@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -35,13 +35,10 @@
 // This code replaces gpsserial with a new gps driver based on
 // a ringbuffer interface, serialclientv2, and new kis_gps interface.
 
-class GPSSerialV2 : public GPSNMEA {
+class kis_gps_serial_v2 : public kis_gps_nmea {
 public:
-    GPSSerialV2(GlobalRegistry *in_globalreg, SharedGpsBuilder in_builder);
-    virtual ~GPSSerialV2();
-
-    // BufferInterface API - buffer available implemented in gpsnmea
-    virtual void BufferError(std::string error);
+    kis_gps_serial_v2(shared_gps_builder in_builder);
+    virtual ~kis_gps_serial_v2();
 
     virtual bool open_gps(std::string in_opts);
 
@@ -52,9 +49,11 @@ public:
 protected:
     time_t error_reconnect_timer;
 
-    std::shared_ptr<PollableTracker> pollabletracker;
-    
-    std::shared_ptr<SerialClientV2> serialclient;
+    std::shared_ptr<pollable_tracker> pollabletracker;
+    std::shared_ptr<serial_client_v2> serialclient;
+
+    // buffer_interface API - buffer available implemented in gpsnmea
+    virtual void buffer_error(std::string error);
 
     // Device
     std::string serial_device;
@@ -73,14 +72,14 @@ protected:
     static int time_event_reconnect(TIMEEVENT_PARMS);
 };
 
-class GPSSerialV2Builder : public KisGpsBuilder {
+class gps_serial_v2_builder : public kis_gps_builder {
 public:
-    GPSSerialV2Builder(GlobalRegistry *in_globalreg) : 
-        KisGpsBuilder(in_globalreg, 0) { 
+    gps_serial_v2_builder() : 
+        kis_gps_builder() { 
         initialize();
     }
 
-    virtual void initialize() {
+    virtual void initialize() override {
         set_int_gps_class("serial");
         set_int_gps_class_description("serial-attached NMEA gps (includes USB GPS)");
         set_int_gps_priority(-1000);
@@ -88,8 +87,8 @@ public:
         set_int_singleton(false);
     }
 
-    virtual SharedGps build_gps(SharedGpsBuilder in_builder) {
-        return SharedGps(new GPSSerialV2(globalreg, in_builder));
+    virtual shared_gps build_gps(shared_gps_builder in_builder) override {
+        return shared_gps(new kis_gps_serial_v2(in_builder));
     }
 };
 

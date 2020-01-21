@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -65,25 +65,28 @@
 #define IEEE80211_RADIOTAP_F_BADFCS     0x40    /* frame has bad FCS */
 #endif
 
-Kis_DLT_Radiotap::Kis_DLT_Radiotap(GlobalRegistry *in_globalreg) :
-	Kis_DLT_Handler(in_globalreg) {
+kis_dlt_radiotap::kis_dlt_radiotap() :
+	kis_dlt_handler() {
 
 	dlt_name = "Radiotap";
 	dlt = DLT_IEEE802_11_RADIO;
-
-	globalreg->InsertGlobal("DLT_RADIOTAP", std::shared_ptr<Kis_DLT_Radiotap>(this));
 
 	_MSG("Registering support for DLT_RADIOTAP packet header decoding", MSGFLAG_INFO);
 
     crc32_init_table_80211(crc32_table);
 }
 
-Kis_DLT_Radiotap::~Kis_DLT_Radiotap() {
-    globalreg->RemoveGlobal("DLT_RADIOTAP");
-}
-
 #define ALIGN_OFFSET(offset, width) \
 	    ( (((offset) + ((width) - 1)) & (~((width) - 1))) - offset )
+
+#define IEEE80211_CHAN_TURBO 0x0010
+#define IEEE80211_CHAN_CCK 0x0020
+#define IEEE80211_CHAN_OFDM 0x0040
+#define IEEE80211_CHAN_2GHZ 0x0080
+#define IEEE80211_CHAN_5GHZ 0x0100
+#define IEEE80211_CHAN_PASSIVE 0x0200
+#define IEEE80211_CHAN_DYN 0x0400
+#define IEEE80211_CHAN_GFSK 0x0800
 
 /*
  * Useful combinations of channel characteristics.
@@ -124,7 +127,7 @@ Kis_DLT_Radiotap::~Kis_DLT_Radiotap() {
 #define BITNO_4(x) (((x) >> 2) ? 2 + BITNO_2((x) >> 2) : BITNO_2((x)))
 #define BITNO_2(x) (((x) & 2) ? 1 : 0)
 #define BIT(n)	(1 << n)
-int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
+int kis_dlt_radiotap::handle_packet(kis_packet *in_pack) {
     static int packnum = 0;
 
     packnum++;
@@ -180,19 +183,20 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
 	struct ieee80211_radiotap_header *hdr;
 	u_int32_t present, next_present;
 	u_int32_t *presentp, *last_presentp;
-	enum ieee80211_radiotap_type bit;
+	enum ieee80211_radiotap_presence bit;
 	int bit0;
 	const u_char *iter;
 	const u_char *iter_start;
 	unsigned int iter_align;
 	int fcs_cut = 0; // Is the FCS bit set?
     bool fcs_flag_invalid = false; // Do we have a flag that tells us the fcs is known bad?
+    int record_num = 0;
 
 	kis_layer1_packinfo *radioheader = NULL;
 
     if (linkchunk->length < sizeof(*hdr)) {
 		// snprintf(errstr, STATUS_MAX, "pcap radiotap converter got corrupted " "Radiotap header length");
-		// globalreg->messagebus->InjectMessage(errstr, MSGFLAG_ERROR);
+		// globalreg->messagebus->inject_message(errstr, MSGFLAG_ERROR);
         return 0;
     }
 
@@ -200,7 +204,7 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
     hdr = (struct ieee80211_radiotap_header *) linkchunk->data;
     if (linkchunk->length < EXTRACT_LE_16BITS(&hdr->it_len)) {
 		// snprintf(errstr, STATUS_MAX, "pcap radiotap converter got corrupted " "Radiotap header length");
-		// globalreg->messagebus->InjectMessage(errstr, MSGFLAG_ERROR);
+		// globalreg->messagebus->inject_message(errstr, MSGFLAG_ERROR);
         return 0;
     }
 
@@ -213,7 +217,7 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
     /* are there more bitmap extensions than bytes in header? */
     if ((EXTRACT_LE_32BITS(last_presentp) & BIT(IEEE80211_RADIOTAP_EXT)) != 0) {
 		// snprintf(errstr, STATUS_MAX, "pcap radiotap converter got corrupted " "Radiotap bitmap length");
-		// globalreg->messagebus->InjectMessage(errstr, MSGFLAG_ERROR);
+		// globalreg->messagebus->inject_message(errstr, MSGFLAG_ERROR);
         return 0;
     }
 
@@ -227,26 +231,31 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
     // not from the byte following the last bitmap. 
     iter_start = (u_char*)(linkchunk->data); 
 
-    for (bit0 = 0, presentp = &hdr->it_present; presentp <= last_presentp;
-         presentp++, bit0 += 32) {
+    bool assigned_signal = false;
+
+    for (bit0 = 0, presentp = &hdr->it_present; presentp <= last_presentp; presentp++, bit0 += 32) {
+        // printf("record num %d\n", record_num);
+        // printf("present %x\n", *presentp);
+        
+        int record_antenna = -1;
+        int record_signal = 0;
+        bool signal_present = false;
+
         for (present = EXTRACT_LE_32BITS(presentp); present; present = next_present) {
             /* clear the least significant bit that is set */
             next_present = present & (present - 1);
 
             /* extract the least significant bit that is set */
-            bit = (enum ieee80211_radiotap_type)
-                (bit0 + BITNO_32(present ^ next_present));
+            bit = (enum ieee80211_radiotap_presence) ((bit0 + BITNO_32(present ^ next_present)) % 32);
+
+            // printf("record %d bit %d\n", record_num, bit);
 
             switch (bit) {
                 case IEEE80211_RADIOTAP_FLAGS:
                 case IEEE80211_RADIOTAP_RATE:
-				/*
-                case IEEE80211_RADIOTAP_DB_ANTSIGNAL:
-                case IEEE80211_RADIOTAP_DB_ANTNOISE:
-				*/
+                case IEEE80211_RADIOTAP_ANTENNA:
                 case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
                 case IEEE80211_RADIOTAP_DBM_ANTNOISE:
-                case IEEE80211_RADIOTAP_ANTENNA:
                     u.u8 = *iter++;
                     break;
                 case IEEE80211_RADIOTAP_DBM_TX_POWER:
@@ -286,11 +295,39 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
                     iter += sizeof(u2.u8);
                     break;
 #endif
+                case IEEE80211_RADIOTAP_RX_FLAGS:
+					iter_align = ALIGN_OFFSET((unsigned int) (iter - iter_start), 2);
+					iter += iter_align;
+
+                    u.u16 = EXTRACT_LE_16BITS(iter);
+                    iter += sizeof(u.u16);
+                    break;
+                case IEEE80211_RADIOTAP_VHT:
+                    /* TODO actually handle this data */
+                    iter_align = ALIGN_OFFSET((unsigned int) (iter - iter_start), 2);
+                    iter += iter_align;
+
+                    iter += 12;
+                    break;
+                case IEEE80211_RADIOTAP_MCS:
+                    /* TODO actually handle this data! */
+                    iter += 3;
+                    break;
+
+                case IEEE80211_RADIOTAP_RADIOTAP_NAMESPACE:
+                    /* Do nothing but acknowledge it */
+                    break;
+
+                case IEEE80211_RADIOTAP_EXT:
+                    /* Do nothing but acknowledge it */
+                    break;
+
                 default:
                     /* this bit indicates a field whose
                      * size we do not know, so we cannot
                      * proceed.
                      */
+                    // printf("Unknown bit %d\n", bit);
                     next_present = 0;
                     continue;
             }
@@ -332,17 +369,12 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
 					/* strip basic rate bit & convert to kismet units */
                     radioheader->datarate = ((u.u8 &~ 0x80) / 2) * 10;
                     break;
-				/* ignore DB values, they're not helpful
-                case IEEE80211_RADIOTAP_DB_ANTSIGNAL:
-                    radioheader->signal_dbm = u.i8;
+                case IEEE80211_RADIOTAP_ANTENNA:
+                    record_antenna = u.u8;
                     break;
-                case IEEE80211_RADIOTAP_DB_ANTNOISE:
-                    radioheader->noise_dbm = u.i8;
-                    break;
-				*/
 				case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
-                    radioheader->signal_type = kis_l1_signal_type_dbm;
-					radioheader->signal_dbm = u.i8;
+                    record_signal = u.i8;
+                    signal_present = true;
 					break;
 				case IEEE80211_RADIOTAP_DBM_ANTNOISE:
                     radioheader->signal_type = kis_l1_signal_type_dbm;
@@ -370,6 +402,23 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
                     break;
             }
         }
+
+        if (signal_present) {
+            // If we haven't assigned a signal, assign the first one we see as the
+            // overall signal level
+            if (!assigned_signal) {
+                assigned_signal = true;
+                radioheader->signal_type = kis_l1_signal_type_dbm;
+                radioheader->signal_dbm = record_signal;
+            }
+
+            if (record_antenna >= 0) {
+                radioheader->signal_type = kis_l1_signal_type_dbm;
+                radioheader->antenna_signal_map[record_antenna] = record_signal;
+            }
+        }
+
+        record_num++;
     }
 
 	if (EXTRACT_LE_16BITS(&(hdr->it_len)) + fcs_cut > (int) linkchunk->length) {
@@ -428,8 +477,7 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
 
 		// Compare it and flag the packet
 		uint32_t calc_crc =
-			crc32_le_80211(globalreg->crc32_table, decapchunk->data, 
-						   decapchunk->length);
+			crc32_le_80211(crc32_table, decapchunk->data, decapchunk->length);
         uint32_t flipped_crc = kis_swap32(calc_crc);
 
         // compare both representations
@@ -460,7 +508,7 @@ int Kis_DLT_Radiotap::HandlePacket(kis_packet *in_pack) {
 #undef BIT
 
 // Taken from the BBN USRP 802.11 encoding code
-unsigned int Kis_DLT_Radiotap::update_crc32_80211(unsigned int crc, const unsigned char *data,
+unsigned int kis_dlt_radiotap::update_crc32_80211(unsigned int crc, const unsigned char *data,
         int len, unsigned int poly) {
 	int i, j;
 	unsigned short ch;
@@ -479,7 +527,7 @@ unsigned int Kis_DLT_Radiotap::update_crc32_80211(unsigned int crc, const unsign
 	return crc;
 }
 
-void Kis_DLT_Radiotap::crc32_init_table_80211(unsigned int *crc32_table) {
+void kis_dlt_radiotap::crc32_init_table_80211(unsigned int *crc32_table) {
 	int i;
 	unsigned char c;
 
@@ -489,7 +537,7 @@ void Kis_DLT_Radiotap::crc32_init_table_80211(unsigned int *crc32_table) {
 	}
 }
 
-unsigned int Kis_DLT_Radiotap::crc32_le_80211(unsigned int *crc32_table, 
+unsigned int kis_dlt_radiotap::crc32_le_80211(unsigned int *crc32_table, 
         const unsigned char *buf, int len) {
 	int i;
 	unsigned int crc = 0xFFFFFFFF;

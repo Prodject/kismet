@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -29,24 +29,43 @@
 #include "kis_mutex.h"
 #include "messagebus.h"
 #include "trackedelement.h"
+#include "trackedcomponent.h"
 #include "kis_net_microhttpd.h"
 
 class tracked_message : public tracker_component {
 public:
-    tracked_message(GlobalRegistry *in_globalreg, int in_id) :
-        tracker_component(in_globalreg, in_id) {
+    tracked_message() :
+        tracker_component() {
         register_fields();
         reserve_fields(NULL);
     }
 
-    tracked_message(GlobalRegistry *in_globalreg, int in_id, SharedTrackerElement e) :
-        tracker_component(in_globalreg, in_id) {
+    tracked_message(int in_id) :
+        tracker_component(in_id) {
+        register_fields();
+        reserve_fields(NULL);
+    }
+
+    tracked_message(int in_id, std::shared_ptr<tracker_element_map> e) :
+        tracker_component(in_id) {
         register_fields();
         reserve_fields(e);
-        }
+    }
 
-    virtual SharedTrackerElement clone_type() {
-        return SharedTrackerElement(new tracked_message(globalreg, get_id()));
+    virtual uint32_t get_signature() const override {
+        return adler32_checksum("tracked_message");
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type() override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t());
+        return std::move(dup);
+    }
+
+    virtual std::unique_ptr<tracker_element> clone_type(int in_id) override {
+        using this_t = std::remove_pointer<decltype(this)>::type;
+        auto dup = std::unique_ptr<this_t>(new this_t(in_id));
+        return std::move(dup);
     }
 
     __Proxy(message, std::string, std::string, std::string, message);
@@ -56,7 +75,7 @@ public:
     void set_from_message(std::string in_msg, int in_flags) {
         set_message(in_msg);
         set_flags(in_flags);
-        set_timestamp(globalreg->timestamp.tv_sec);
+        set_timestamp(time(0));
     }
 
     bool operator<(const tracked_message& comp) const {
@@ -64,59 +83,49 @@ public:
     }
 
 protected:
-    virtual void register_fields() {
+    virtual void register_fields() override {
         tracker_component::register_fields();
 
-        message_id =
-            RegisterField("kismet.messagebus.message_string", TrackerString,
-                    "Message content", &message);
-        flags_id =
-            RegisterField("kismet.messagebus.message_flags", TrackerInt32,
-                    "Message flags (per messagebus.h)", &flags);
-        timestamp_id =
-            RegisterField("kismet.messagebus.message_time", TrackerUInt64,
-                    "Message time_t", &timestamp);
+        register_field("kismet.messagebus.message_string", "Message content", &message);
+        register_field("kismet.messagebus.message_flags", "Message flags (per messagebus.h)", &flags);
+        register_field("kismet.messagebus.message_time", "Message time_t", &timestamp);
     }
 
-    SharedTrackerElement message;
-    int message_id;
-
-    SharedTrackerElement flags;
-    int flags_id;
-
-    SharedTrackerElement timestamp;
-    int timestamp_id;
+    std::shared_ptr<tracker_element_string> message;
+    std::shared_ptr<tracker_element_int32> flags;
+    std::shared_ptr<tracker_element_uint64> timestamp;
 };
 
-class RestMessageClient : public MessageClient, public Kis_Net_Httpd_CPPStream_Handler,
-    public LifetimeGlobal {
+class rest_message_client : public message_client, public kis_net_httpd_cppstream_handler,
+    public lifetime_global {
 public:
-    static std::shared_ptr<RestMessageClient> 
-        create_messageclient(GlobalRegistry *in_globalreg) {
-        std::shared_ptr<RestMessageClient> mon(new RestMessageClient(in_globalreg, NULL));
-        in_globalreg->RegisterLifetimeGlobal(mon);
-        in_globalreg->InsertGlobal("REST_MSG_CLIENT", mon);
+    static std::shared_ptr<rest_message_client> 
+        create_messageclient(global_registry *in_globalreg) {
+        std::shared_ptr<rest_message_client> mon(new rest_message_client(in_globalreg, NULL));
+        in_globalreg->register_lifetime_global(mon);
+        in_globalreg->insert_global("REST_MSG_CLIENT", mon);
         return mon;
     }
 
 private:
-    RestMessageClient(GlobalRegistry *in_globalreg, void *in_aux);
+    rest_message_client(global_registry *in_globalreg, void *in_aux);
 
 public:
-	virtual ~RestMessageClient();
-    void ProcessMessage(std::string in_msg, int in_flags);
+	virtual ~rest_message_client();
 
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
+    virtual void process_message(std::string in_msg, int in_flags) override;
 
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
+
+    virtual void httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size, std::stringstream &stream);
+            size_t *upload_data_size, std::stringstream &stream) override;
 
 protected:
     kis_recursive_timed_mutex msg_mutex;
 
-    std::vector<std::shared_ptr<tracked_message> > message_vec;
+    std::list<std::shared_ptr<tracked_message> > message_list;
 
     int message_vec_id, message_entry_id, message_timestamp_id;
 };

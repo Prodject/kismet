@@ -19,151 +19,127 @@
 #include "util.h"
 
 #include "channeltracker2.h"
-#include "msgpack_adapter.h"
 #include "json_adapter.h"
 #include "devicetracker.h"
 #include "devicetracker_component.h"
 #include "packinfo_signal.h"
 
-Channeltracker_V2::Channeltracker_V2(GlobalRegistry *in_globalreg) :
-    tracker_component(in_globalreg, 0), Kis_Net_Httpd_CPPStream_Handler(in_globalreg) {
+channel_tracker_v2::channel_tracker_v2(global_registry *in_globalreg) :
+    lifetime_global() {
+
+    lock.set_name("channeltrackerv2");
 
     // Number of seconds we consider a device to be active on a frequency 
     // after the last time we see it
     device_decay = 5;
 
-    globalreg = in_globalreg;
+    auto packetchain = Globalreg::fetch_mandatory_global_as<packet_chain>("PACKETCHAIN");
 
-    register_fields();
-    reserve_fields(NULL);
+    timetracker =
+        Globalreg::fetch_mandatory_global_as<time_tracker>();
 
-    std::shared_ptr<Packetchain> packetchain = 
-        Globalreg::FetchMandatoryGlobalAs<Packetchain>(globalreg, "PACKETCHAIN");
+    entrytracker =
+        Globalreg::fetch_mandatory_global_as<entry_tracker>();
 
-    packetchain->RegisterHandler(&PacketChainHandler, this, CHAINPOS_LOGGING, 0);
 
-	pack_comp_device = packetchain->RegisterPacketComponent("DEVICE");
-	pack_comp_common = packetchain->RegisterPacketComponent("COMMON");
-	pack_comp_l1data = globalreg->packetchain->RegisterPacketComponent("RADIODATA");
+    packetchain->register_handler(&packet_chain_handler, this, CHAINPOS_LOGGING, 0);
+
+	pack_comp_device = packetchain->register_packet_component("DEVICE");
+	pack_comp_common = packetchain->register_packet_component("COMMON");
+	pack_comp_l1data = packetchain->register_packet_component("RADIODATA");
 
     devicetracker =
-        Globalreg::FetchMandatoryGlobalAs<Devicetracker>(globalreg, "DEVICE_TRACKER");
+        Globalreg::fetch_mandatory_global_as<device_tracker>("DEVICETRACKER");
 
     struct timeval trigger_tm;
-    trigger_tm.tv_sec = time(0) + 1;
+    trigger_tm.tv_sec = time(0) + 10;
     trigger_tm.tv_usec = 0;
 
-    std::shared_ptr<Timetracker> timetracker =
-        Globalreg::FetchMandatoryGlobalAs<Timetracker>(globalreg, "TIMETRACKER");
+    frequency_map =
+        entrytracker->register_and_get_field_as<tracker_element_double_map>(
+                "kismet.channeltracker.frequency_map", 
+                tracker_element_factory<tracker_element_double_map>(),
+                "Usage by frequency");
 
-    timer_id = timetracker->RegisterTimer(0, &trigger_tm, 0, this);
-}
+    channel_map =
+        entrytracker->register_and_get_field_as<tracker_element_string_map>(
+                "kismet.channeltracker.channel_map",
+                tracker_element_factory<tracker_element_string_map>(),
+                "Usage by named channel");
 
-Channeltracker_V2::~Channeltracker_V2() {
-    local_eol_locker locker(&lock);
+    channel_entry_id =
+    channel_entry_id = 
+        entrytracker->register_field("kismet.channeltracker.channel",
+                tracker_element_factory<channel_tracker_v2_channel>(),
+                "channel/frequency entry");
 
-    std::shared_ptr<Timetracker> timetracker =
-        Globalreg::FetchGlobalAs<Timetracker>(globalreg, "TIMETRACKER");
-    if (timetracker != NULL)
-        timetracker->RemoveTimer(timer_id);
+    channels_endp =
+        std::make_shared<kis_net_httpd_simple_tracked_endpoint>(
+                "/channels/channels",
+                [this]() -> std::shared_ptr<tracker_element> {
+                    local_locker l(&lock);
+                    return channels_endp_handler();
+                });
 
-    std::shared_ptr<Packetchain> packetchain = 
-        Globalreg::FetchGlobalAs<Packetchain>(globalreg, "PACKETCHAIN");
-    if (packetchain != NULL)
-        packetchain->RemoveHandler(&PacketChainHandler, CHAINPOS_LOGGING);
-
-    globalreg->RemoveGlobal("CHANNEL_TRACKER");
-}
-
-void Channeltracker_V2::register_fields() {
-    tracker_component::register_fields();
-
-    freq_map_id =
-        RegisterField("kismet.channeltracker.frequency_map", TrackerDoubleMap,
-                "Frequency use", &frequency_map);
-
-    channel_map_id =
-        RegisterField("kismet.channeltracker.channel_map", TrackerStringMap,
-                "Channel use", &channel_map);
-
-    std::shared_ptr<Channeltracker_V2_Channel> chan_builder(new Channeltracker_V2_Channel(globalreg, 0));
-    channel_entry_id = RegisterComplexField("kismet.channeltracker.channel",
-            chan_builder, "channel/frequency entry");
-}
-
-bool Channeltracker_V2::Httpd_VerifyPath(const char *path, const char *method) {
-    if (strcmp(method, "GET") != 0)
-        return false;
-
-    if (!Httpd_CanSerialize(path))
-        return false;
-
-    std::string stripped = Httpd_StripSuffix(path);
-
-    if (stripped == "/channels/channels")
-        return true;
-
-    return false;
-}
-
-void Channeltracker_V2::Httpd_CreateStreamResponse(
-        Kis_Net_Httpd *httpd __attribute__((unused)),
-        Kis_Net_Httpd_Connection *connection __attribute__((unused)),
-        const char *path, const char *method, 
-        const char *upload_data __attribute__((unused)),
-        size_t *upload_data_size __attribute__((unused)), 
-        std::stringstream &stream) {
-
-    if (strcmp(method, "GET") != 0) {
-        return;
-    }
-
-    std::string stripped = Httpd_StripSuffix(path);
-
-    if (stripped == "/channels/channels") {
-        local_locker locker(&lock);
-        std::shared_ptr<Channeltracker_V2> cv2 = 
-            Globalreg::FetchGlobalAs<Channeltracker_V2>(globalreg, "CHANNEL_TRACKER");
-        Httpd_Serialize(path, stream, cv2);
-    }
+    timer_id = timetracker->register_timer(SERVER_TIMESLICES_SEC, nullptr, 1, 
+            [this](int evt_id) -> int {
+                return gather_devices_event(evt_id);
+            });
 
 }
 
-class channeltracker_v2_device_worker : public DevicetrackerFilterWorker {
+channel_tracker_v2::~channel_tracker_v2() {
+    local_locker locker(&lock);
+
+    auto timetracker = Globalreg::FetchGlobalAs<time_tracker>("TIMETRACKER");
+    if (timetracker != nullptr)
+        timetracker->remove_timer(timer_id);
+
+    auto packetchain = Globalreg::FetchGlobalAs<packet_chain>("PACKETCHAIN");
+    if (packetchain != nullptr)
+        packetchain->remove_handler(&packet_chain_handler, CHAINPOS_LOGGING);
+
+    Globalreg::globalreg->RemoveGlobal("CHANNEL_TRACKER");
+}
+
+std::shared_ptr<tracker_element_map> channel_tracker_v2::channels_endp_handler() {
+    auto ret = std::make_shared<tracker_element_map>();
+    ret->insert(channel_map);
+    ret->insert(frequency_map);
+    return ret;
+}
+
+class channeltracker_v2_device_worker : public device_tracker_filter_worker {
 public:
-    channeltracker_v2_device_worker(GlobalRegistry *in_globalreg,
-            Channeltracker_V2 *channelv2) {
-        globalreg = in_globalreg;
+    channeltracker_v2_device_worker(channel_tracker_v2 *channelv2) {
         this->channelv2 = channelv2;
         stime = time(0);
     }
 
-    virtual ~channeltracker_v2_device_worker() {
-
-    }
+    virtual ~channeltracker_v2_device_worker() { }
 
     // Count all the devices.  We use a filter worker but 'match' on all
     // and count them into our local map
-    virtual bool MatchDevice(Devicetracker *devicetracker __attribute__((unused)),
+    virtual bool match_device(device_tracker *devicetracker __attribute__((unused)),
             std::shared_ptr<kis_tracked_device_base> device) {
-        if (device == NULL)
-            return false;
 
-        if (device->get_last_time() < stime - channelv2->device_decay)
-            return false;
-
-        if (device->get_frequency() == 0)
+        auto freq = device->get_frequency();
+        if (freq == 0)
             return false;
 
         {
             local_locker lock(&workermutex);
 
-            auto i = device_count.find(device->get_frequency());
+            auto i = device_count.find(freq);
 
             if (i != device_count.end()) {
-                i->second++;
+                if (device->get_last_time() > (stime - channelv2->device_decay))
+                    i->second++;
             } else {
-                device_count.emplace(device->get_frequency(), 1);
+                if (device->get_last_time() > (stime - channelv2->device_decay))
+                    device_count[freq] = 1;
+                else
+                    device_count[freq] = 0;
             }
         }
 
@@ -171,105 +147,92 @@ public:
     }
 
     // Send it back to our channel tracker
-    virtual void Finalize(Devicetracker *devicetracker __attribute__((unused))) {
-        channelv2->update_device_counts(device_count);
+    virtual void finalize(device_tracker *devicetracker __attribute__((unused))) {
+        channelv2->update_device_counts(device_count, stime);
     }
 
 protected:
-    GlobalRegistry *globalreg;
-    Channeltracker_V2 *channelv2;
+    channel_tracker_v2 *channelv2;
 
-    std::map<double, unsigned int> device_count;
+    std::unordered_map<double, unsigned int> device_count;
 
     time_t stime;
 
     kis_recursive_timed_mutex workermutex;
-
 };
 
 
-int Channeltracker_V2::timetracker_event(int event_id __attribute__((unused))) {
-    local_locker locker(&lock);
-
-    channeltracker_v2_device_worker worker(globalreg, this);
-    devicetracker->MatchOnDevices(&worker);
-
-    // Reschedule
-    struct timeval trigger_tm;
-    trigger_tm.tv_sec = time(0) + 1;
-    trigger_tm.tv_usec = 0;
-
-    std::shared_ptr<Timetracker> timetracker =
-        Globalreg::FetchGlobalAs<Timetracker>(globalreg, "TIMETRACKER");
-    if (timetracker != NULL)
-        timer_id = 
-            timetracker->RegisterTimer(0, &trigger_tm, 0, this);
+int channel_tracker_v2::gather_devices_event(int event_id __attribute__((unused))) {
+    auto worker = std::make_shared<channeltracker_v2_device_worker>(this);
+    devicetracker->do_readonly_device_work(worker);
 
     return 1;
 }
 
-void Channeltracker_V2::update_device_counts(std::map<double, unsigned int> in_counts) {
+void channel_tracker_v2::update_device_counts(std::unordered_map<double, unsigned int> in_counts, time_t ts) {
     local_locker locker(&lock);
-    time_t ts = time(0);
 
-    for (std::map<double, unsigned int>::iterator i = in_counts.begin();
-            i != in_counts.end(); ++i) {
+    for (auto i : in_counts) {
+        auto imi = frequency_map->find(i.first);
 
-        TrackerElement::double_map_iterator imi =
-            frequency_map->double_find(i->first);
+        std::shared_ptr<channel_tracker_v2_channel> freq_channel;
 
-        // If we can't find the device, skip it
-        if (imi == frequency_map->double_end())
-            continue;
+        // Make a frequency
+        if (imi == frequency_map->end()) {
+            freq_channel =
+                std::make_shared<channel_tracker_v2_channel>(channel_entry_id);
+            freq_channel->set_frequency(i.first);
+            frequency_map->insert(i.first, freq_channel);
+        } else {
+            freq_channel = std::static_pointer_cast<channel_tracker_v2_channel>(imi->second);
+        }
 
         // Update the device RRD for the count
-        std::static_pointer_cast<Channeltracker_V2_Channel>(imi->second)->
-            get_device_rrd()->add_sample(i->second, ts);
+        freq_channel->get_device_rrd()->add_sample(i.second, ts);
     }
 }
 
-int Channeltracker_V2::PacketChainHandler(CHAINCALL_PARMS) {
-    Channeltracker_V2 *cv2 = (Channeltracker_V2 *) auxdata;
+int channel_tracker_v2::packet_chain_handler(CHAINCALL_PARMS) {
+    channel_tracker_v2 *cv2 = (channel_tracker_v2 *) auxdata;
 
     local_locker locker(&(cv2->lock));
 
-    kis_layer1_packinfo *l1info =
-        (kis_layer1_packinfo *) in_pack->fetch(cv2->pack_comp_l1data);
-	kis_common_info *common = 
-		(kis_common_info *) in_pack->fetch(cv2->pack_comp_common);
+    auto l1info = in_pack->fetch<kis_layer1_packinfo>(cv2->pack_comp_l1data);
+	auto common = in_pack->fetch<kis_common_info>(cv2->pack_comp_common);
 
     // Nothing to do with no l1info
-    if (l1info == NULL)
+    if (l1info == nullptr)
         return 1;
 
-    std::shared_ptr<Channeltracker_V2_Channel> freq_channel;
-    std::shared_ptr<Channeltracker_V2_Channel> chan_channel;
+    std::shared_ptr<channel_tracker_v2_channel> freq_channel;
+    std::shared_ptr<channel_tracker_v2_channel> chan_channel;
 
     // Find or make a frequency record if we know our frequency
     if (l1info->freq_khz != 0) {
-        TrackerElement::double_map_iterator imi =
-            cv2->frequency_map->double_find(l1info->freq_khz);
+        auto imi = cv2->frequency_map->find(l1info->freq_khz);
 
-        if (imi == cv2->frequency_map->double_end()) {
-            freq_channel.reset(new Channeltracker_V2_Channel(cv2->globalreg, cv2->channel_entry_id));
+        if (imi == cv2->frequency_map->end()) {
+            freq_channel =
+                std::make_shared<channel_tracker_v2_channel>(cv2->channel_entry_id);
             freq_channel->set_frequency(l1info->freq_khz);
-            cv2->frequency_map->add_doublemap(l1info->freq_khz, freq_channel);
+            cv2->frequency_map->insert(l1info->freq_khz, freq_channel);
         } else {
-            freq_channel = std::static_pointer_cast<Channeltracker_V2_Channel>(imi->second);
+            freq_channel = std::static_pointer_cast<channel_tracker_v2_channel>(imi->second);
         }
     }
 
-    if (common != NULL) {
+    if (common != nullptr) {
         if (!(common->channel == "0") && !(common->channel == "")) {
-            TrackerElement::string_map_iterator smi =
-                cv2->channel_map->string_find(common->channel);
+            auto smi = cv2->channel_map->find(common->channel);
 
-            if (smi == cv2->channel_map->string_end()) {
-                chan_channel.reset(new Channeltracker_V2_Channel(cv2->globalreg, cv2->channel_entry_id));
+            if (smi == cv2->channel_map->end()) {
+                chan_channel =
+                    std::make_shared<channel_tracker_v2_channel>(cv2->channel_entry_id);
+
                 chan_channel->set_channel(common->channel);
-                cv2->channel_map->add_stringmap(common->channel, chan_channel);
+                cv2->channel_map->insert(common->channel, chan_channel);
             } else {
-                chan_channel = std::static_pointer_cast<Channeltracker_V2_Channel>(smi->second);
+                chan_channel = std::static_pointer_cast<channel_tracker_v2_channel>(smi->second);
             }
         }
     }
@@ -281,7 +244,7 @@ int Channeltracker_V2::PacketChainHandler(CHAINCALL_PARMS) {
     time_t stime = time(0);
 
     if (freq_channel) {
-        (*(freq_channel->get_signal_data())) += *(l1info);
+        freq_channel->get_signal_data()->append_signal(*l1info, false, 0);
         freq_channel->get_packets_rrd()->add_sample(1, stime);
 
         if (common != NULL) {
@@ -295,7 +258,7 @@ int Channeltracker_V2::PacketChainHandler(CHAINCALL_PARMS) {
     }
 
     if (chan_channel) {
-        (*(chan_channel->get_signal_data())) += *(l1info);
+        chan_channel->get_signal_data()->append_signal(*l1info, false, 0);
         chan_channel->get_packets_rrd()->add_sample(1, stime);
 
         if (common != NULL) {

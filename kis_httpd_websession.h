@@ -29,33 +29,37 @@
 // We need to subclass the HTTPD handler directly because even though we can
 // generally act like a stream, we need to be able to directly manipulate the
 // response header
-class Kis_Httpd_Websession : public Kis_Net_Httpd_CPPStream_Handler, 
-    public LifetimeGlobal, public DeferredStartup {
+class kis_httpd_websession : public kis_net_httpd_cppstream_handler, 
+    public lifetime_global, public deferred_startup {
 public:
-    static std::shared_ptr<Kis_Httpd_Websession> 
-        create_websession(GlobalRegistry *in_globalreg) {
-        std::shared_ptr<Kis_Httpd_Websession> mon(new Kis_Httpd_Websession(in_globalreg));
-        in_globalreg->RegisterLifetimeGlobal(mon);
-        in_globalreg->RegisterDeferredGlobal(mon);
-        in_globalreg->InsertGlobal("WEBSESSION", mon);
+    static std::string global_name() { return "WEBSESSION"; }
+
+    static std::shared_ptr<kis_httpd_websession> 
+        create_websession() {
+        std::shared_ptr<kis_httpd_websession> mon(new kis_httpd_websession());
+        Globalreg::globalreg->register_lifetime_global(mon);
+        Globalreg::globalreg->register_deferred_global(mon);
+        Globalreg::globalreg->insert_global(global_name(), mon);
         return mon;
     }
 
 private:
-    Kis_Httpd_Websession(GlobalRegistry *in_globalreg);
+    kis_httpd_websession();
 
 public:
-    ~Kis_Httpd_Websession();
+    ~kis_httpd_websession();
 
-    virtual void Deferred_Startup();
-    virtual void Deferred_Shutdown() { };
+    virtual void trigger_deferred_startup() override;
+    virtual void trigger_deferred_shutdown() override { };
 
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
 
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+    virtual void httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size, std::stringstream &stream);
+            size_t *upload_data_size, std::stringstream &stream) override;
+
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls) override;
 
     virtual void set_login(std::string in_username, std::string in_password);
 
@@ -67,19 +71,20 @@ public:
     std::string get_password() { return conf_password; }
 
 protected:
+    kis_recursive_timed_mutex mutex;
+
     bool activated; 
 
     void userdir_login();
 
-    GlobalRegistry *globalreg;
+    bool global_config;
+    bool user_config;
 
     std::string user_httpd_config_file;
-    ConfigFile *user_httpd_config;
+    config_file *user_httpd_config;
 
-    bool global_config;
     std::string conf_username;
     std::string conf_password;
-
 };
 
 #endif

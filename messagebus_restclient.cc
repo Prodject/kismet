@@ -22,85 +22,83 @@
 #include "messagebus_restclient.h"
 
 #include "json_adapter.h"
-#include "msgpack_adapter.h"
 
-RestMessageClient::RestMessageClient(GlobalRegistry *in_globalreg, void *in_aux) :
-    MessageClient(in_globalreg, in_aux),
-    Kis_Net_Httpd_CPPStream_Handler(in_globalreg) {
+rest_message_client::rest_message_client(global_registry *in_globalreg, void *in_aux) :
+    message_client(in_globalreg, in_aux),
+    kis_net_httpd_cppstream_handler() {
 
     globalreg = in_globalreg;
 
     message_vec_id =
-        globalreg->entrytracker->RegisterField("kismet.messagebus.list",
-                TrackerVector, "list of messages");
+        globalreg->entrytracker->register_field("kismet.messagebus.list",
+                tracker_element_factory<tracker_element_vector>(),
+                "list of messages");
 
     message_timestamp_id =
-        globalreg->entrytracker->RegisterField("kismet.messagebus.timestamp",
-                TrackerUInt64, "message update timestamp");
-
-    std::shared_ptr<tracked_message> msg_builder(new tracked_message(globalreg, 0));
+        globalreg->entrytracker->register_field("kismet.messagebus.timestamp",
+                tracker_element_factory<tracker_element_uint64>(),
+                "message update timestamp");
 
     message_entry_id =
-        globalreg->entrytracker->RegisterField("kismet.messagebus.message",
-                msg_builder, "Kismet message");
+        globalreg->entrytracker->register_field("kismet.messagebus.message",
+                tracker_element_factory<tracked_message>(),
+                "Kismet message");
 
-	globalreg->messagebus->RegisterClient(this, MSGFLAG_ALL);
+    Globalreg::globalreg->messagebus->register_client(this, MSGFLAG_ALL);
+
+    bind_httpd_server();
 }
 
-RestMessageClient::~RestMessageClient() {
+rest_message_client::~rest_message_client() {
     local_eol_locker lock(&msg_mutex);
 
-    globalreg->messagebus->RemoveClient(this);
+    globalreg->messagebus->remove_client(this);
 
     globalreg->RemoveGlobal("REST_MSG_CLIENT");
 
-    message_vec.clear();
+    message_list.clear();
 }
 
-void RestMessageClient::ProcessMessage(std::string in_msg, int in_flags) {
-    // Don't propagate LOCAL messages
-    if (in_flags & MSGFLAG_LOCAL)
+void rest_message_client::process_message(std::string in_msg, int in_flags) {
+    // Don't propagate LOCAL or DEBUG messages
+    if ((in_flags & MSGFLAG_LOCAL) || (in_flags & MSGFLAG_DEBUG))
         return;
 
-    std::shared_ptr<tracked_message> msg = 
-        std::static_pointer_cast<tracked_message>(globalreg->entrytracker->GetTrackedInstance(message_entry_id));
+    auto msg =
+        std::make_shared<tracked_message>(message_entry_id);
 
     msg->set_from_message(in_msg, in_flags);
 
     {
         local_locker lock(&msg_mutex);
 
-        message_vec.push_back(msg);
+        message_list.push_back(msg);
 
         // Hardcode a backlog count right now
-        if (message_vec.size() > 50) {
-            message_vec.erase(message_vec.begin());
+        if (message_list.size() > 50) {
+            message_list.pop_front();
         }
     }
 }
 
-bool RestMessageClient::Httpd_VerifyPath(const char *path, const char *method) {
+bool rest_message_client::httpd_verify_path(const char *path, const char *method) {
     if (strcmp(method, "GET") != 0) {
         return false;
     }
 
     // Split URL and process
-    std::vector<std::string> tokenurl = StrTokenize(path, "/");
+    std::vector<std::string> tokenurl = str_tokenize(path, "/");
     if (tokenurl.size() < 3)
         return false;
 
     if (tokenurl[1] == "messagebus") {
-        if (tokenurl[2] == "all_messages.msgpack") {
-            return true;
-        } else if (tokenurl[2] == "all_messages.json") {
+        if (tokenurl[2] == "all_messages.json") {
             return true;
         } else if (tokenurl[2] == "last-time") {
             if (tokenurl.size() < 5)
                 return false;
 
-            if (tokenurl[4] == "messages.msgpack")
-                return true;
-            else if (tokenurl[4] == "messages.json")
+            if (tokenurl[4] == "messages.json")
                 return true;
             else
                 return false;
@@ -110,9 +108,9 @@ bool RestMessageClient::Httpd_VerifyPath(const char *path, const char *method) {
     return false;
 }
 
-void RestMessageClient::Httpd_CreateStreamResponse(
-        Kis_Net_Httpd *httpd __attribute__((unused)),
-        Kis_Net_Httpd_Connection *connection __attribute__((unused)),
+void rest_message_client::httpd_create_stream_response(
+        kis_net_httpd *httpd __attribute__((unused)),
+        kis_net_httpd_connection *connection __attribute__((unused)),
         const char *path, const char *method, const char *upload_data,
         size_t *upload_data_size, std::stringstream &stream) {
 
@@ -124,11 +122,11 @@ void RestMessageClient::Httpd_CreateStreamResponse(
     }
 
     // All paths end in final element
-    if (!Httpd_CanSerialize(path))
+    if (!httpd_can_serialize(path))
         return;
 
     // Split URL and process
-    std::vector<std::string> tokenurl = StrTokenize(path, "/");
+    std::vector<std::string> tokenurl = str_tokenize(path, "/");
     if (tokenurl.size() < 3)
         return;
 
@@ -137,7 +135,7 @@ void RestMessageClient::Httpd_CreateStreamResponse(
             if (tokenurl.size() < 5)
                 return;
 
-            if (!Httpd_CanSerialize(tokenurl[4]))
+            if (!httpd_can_serialize(tokenurl[4]))
                 return;
 
             long lastts;
@@ -148,7 +146,7 @@ void RestMessageClient::Httpd_CreateStreamResponse(
 
             since_time = lastts;
 
-        } else if (Httpd_StripSuffix(tokenurl[2]) != "all_messages") {
+        } else if (httpd_strip_suffix(tokenurl[2]) != "all_messages") {
             return;
         }
     }
@@ -156,30 +154,31 @@ void RestMessageClient::Httpd_CreateStreamResponse(
     {
         local_locker lock(&msg_mutex);
 
-        SharedTrackerElement wrapper;
-        SharedTrackerElement msgvec(globalreg->entrytracker->GetTrackedInstance(message_vec_id));
+        std::shared_ptr<tracker_element> transmit;
+        std::shared_ptr<tracker_element_map> wrapper;
+        auto msgvec = std::make_shared<tracker_element_vector>(message_vec_id);
        
         // If we're doing a time-since, wrap the vector
         if (wrap) {
-            wrapper.reset(new TrackerElement(TrackerMap));
-            wrapper->add_map(msgvec);
+            wrapper =
+                std::make_shared<tracker_element_map>();
+            wrapper->insert(msgvec);
 
-            SharedTrackerElement ts =
-                globalreg->entrytracker->GetTrackedInstance(message_timestamp_id);
-            ts->set((uint64_t) globalreg->timestamp.tv_sec);
-            wrapper->add_map(ts);
+            auto ts =
+                std::make_shared<tracker_element_uint64>(message_timestamp_id, time(0));
+            wrapper->insert(ts);
+
+            transmit = wrapper;
         } else {
-            wrapper = msgvec;
+            transmit = msgvec;
         }
 
-        for (std::vector<std::shared_ptr<tracked_message> >::iterator i = message_vec.begin();
-                i != message_vec.end(); ++i) {
-            if (since_time < (*i)->get_timestamp()) {
-                msgvec->add_vector(*i);
-            }
+        for (auto i : message_list) {
+            if (since_time < i->get_timestamp())
+                msgvec->push_back(i);
         }
 
-        Httpd_Serialize(path, stream, wrapper);
+        httpd_serialize(path, stream, transmit, nullptr, connection);
     }
 }
 

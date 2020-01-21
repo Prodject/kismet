@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -22,8 +22,9 @@
 #include "globalregistry.h"
 #include "util.h"
 
-KisDatabase::KisDatabase(GlobalRegistry *in_globalreg, std::string in_module_name) :
+kis_database::kis_database(global_registry *in_globalreg, std::string in_module_name) :
         ds_module_name(in_module_name) {
+    ds_mutex.set_name(fmt::format("kis_database({})", in_module_name));
 
     globalreg = in_globalreg;
 
@@ -31,8 +32,8 @@ KisDatabase::KisDatabase(GlobalRegistry *in_globalreg, std::string in_module_nam
 
 }
 
-KisDatabase::~KisDatabase() {
-    local_eol_locker lock(&ds_mutex);
+kis_database::~kis_database() {
+    local_locker lock(&ds_mutex);
 
     if (db != NULL) {
         sqlite3_close(db);
@@ -40,14 +41,14 @@ KisDatabase::~KisDatabase() {
     }
 }
 
-bool KisDatabase::Database_Open(std::string in_file_path) {
+bool kis_database::database_open(std::string in_file_path) {
     char *sErrMsg = NULL;
 
     if (in_file_path.length() == 0) {
         std::string config_dir_path_raw = 
-            globalreg->kismet_config->FetchOpt("configdir");
+            globalreg->kismet_config->fetch_opt("configdir");
         std::string config_dir_path =
-            globalreg->kismet_config->ExpandLogPath(config_dir_path_raw, "", "", 0, 1);
+            globalreg->kismet_config->expand_log_path(config_dir_path_raw, "", "", 0, 1);
 
         ds_dbfile = config_dir_path + "/" + ds_module_name + ".db3"; 
     } else {
@@ -61,7 +62,7 @@ bool KisDatabase::Database_Open(std::string in_file_path) {
     r = sqlite3_open(ds_dbfile.c_str(), &db);
 
     if (r) {
-        _MSG("KisDatabase unable to open file " + ds_dbfile + ": " +
+        _MSG("kis_database unable to open file " + ds_dbfile + ": " +
                 std::string(sqlite3_errmsg(db)), MSGFLAG_ERROR);
         db = NULL;
         return false;
@@ -83,7 +84,7 @@ bool KisDatabase::Database_Open(std::string in_file_path) {
             (void *) &k_t_exists, &sErrMsg);
 
     if (r != SQLITE_OK) {
-        _MSG("KisDatabase unable to query for KISMET master table in " + ds_dbfile + ": " + 
+        _MSG("kis_database unable to query for KISMET master table in " + ds_dbfile + ": " + 
                 std::string(sErrMsg), MSGFLAG_ERROR);
         sqlite3_close(db);
         db = NULL;
@@ -93,14 +94,14 @@ bool KisDatabase::Database_Open(std::string in_file_path) {
     // If the table doesn't exist, build it...
     if (!k_t_exists) {
         // Build the master table
-        if (!Database_CreateMasterTable())
+        if (!database_create_master_table())
             return false;
     }
 
     return true;
 }
 
-void KisDatabase::Database_Close() {
+void kis_database::database_close() {
     local_locker dblock(&ds_mutex);
 
     if (db != NULL) {
@@ -110,7 +111,7 @@ void KisDatabase::Database_Close() {
     db = NULL;
 }
 
-bool KisDatabase::Database_CreateMasterTable() {
+bool kis_database::database_create_master_table() {
     local_locker dblock(&ds_mutex);
 
     std::string sql;
@@ -130,7 +131,7 @@ bool KisDatabase::Database_CreateMasterTable() {
             [] (void *, int, char **, char **) -> int { return 0; }, NULL, &sErrMsg);
 
     if (r != SQLITE_OK) {
-        _MSG("KisDatabase unable to create KISMET master table in " + ds_dbfile + ": " +
+        _MSG("kis_database unable to create KISMET master table in " + ds_dbfile + ": " +
                 std::string(sErrMsg), MSGFLAG_ERROR);
         sqlite3_close(db);
         db = NULL;
@@ -143,7 +144,7 @@ bool KisDatabase::Database_CreateMasterTable() {
     r = sqlite3_prepare(db, sql.c_str(), sql.length(), &stmt, &pz);
 
     if (r != SQLITE_OK) {
-        _MSG("KisDatabase unable to generate prepared statement for master table in " +
+        _MSG("kis_database unable to generate prepared statement for master table in " +
                 ds_dbfile + ": " + std::string(sqlite3_errmsg(db)), MSGFLAG_ERROR);
         sqlite3_close(db);
         db = NULL;
@@ -164,13 +165,13 @@ bool KisDatabase::Database_CreateMasterTable() {
     return true;
 }
 
-bool KisDatabase::Database_Valid() {
+bool kis_database::database_valid() {
     local_locker dblock(&ds_mutex);
 
     return (db != NULL);
 }
 
-unsigned int KisDatabase::Database_GetDBVersion() {
+unsigned int kis_database::database_get_db_version() {
     local_locker dblock(&ds_mutex);
 
     if (db == NULL)
@@ -185,8 +186,10 @@ unsigned int KisDatabase::Database_GetDBVersion() {
 
     r = sqlite3_exec(db, sql.c_str(),
             [] (void *ver, int argc, char **data, char **) -> int {
-                if (argc != 1)
+                if (argc != 1) {
                     *((unsigned int *) ver) = 0;
+                    return 0;
+                }
 
                 if (sscanf(data[0], "%u", (unsigned int *) ver) != 1) {
                     *((unsigned int *) ver) = 0;
@@ -196,7 +199,7 @@ unsigned int KisDatabase::Database_GetDBVersion() {
             }, &v, &sErrMsg);
 
     if (r != SQLITE_OK) {
-        _MSG("KisDatabase unable to query db_version in" + ds_dbfile + ": " +
+        _MSG("kis_database unable to query db_version in" + ds_dbfile + ": " +
                 std::string(sErrMsg), MSGFLAG_ERROR);
         sqlite3_close(db);
         db = NULL;
@@ -206,7 +209,7 @@ unsigned int KisDatabase::Database_GetDBVersion() {
     return v;
 }
 
-bool KisDatabase::Database_SetDBVersion(unsigned int version) {
+bool kis_database::database_set_db_version(unsigned int version) {
     local_locker dblock(&ds_mutex);
 
     if (db == NULL)
@@ -224,7 +227,7 @@ bool KisDatabase::Database_SetDBVersion(unsigned int version) {
     r = sqlite3_prepare(db, sql.c_str(), sql.length(), &stmt, &pz);
 
     if (r != SQLITE_OK) {
-        _MSG("KisDatabase unable to generate prepared statement to update master table in " +
+        _MSG("kis_database unable to generate prepared statement to update master table in " +
                 ds_dbfile + ":" + std::string(sqlite3_errmsg(db)), MSGFLAG_ERROR);
         sqlite3_close(db);
         db = NULL;
@@ -244,3 +247,59 @@ bool KisDatabase::Database_SetDBVersion(unsigned int version) {
     return true;
 }
 
+sqlite3_stmt *kis_database_binder::make_query(sqlite3 *db, std::string base) {
+    std::stringstream query;
+
+    const char *pz = nullptr;
+    sqlite3_stmt *stmt = nullptr;
+    int r;
+
+    query << base;
+
+    if (bindings.size() == 0) {
+        query << ";";
+        printf("%s\n", query.str().c_str());
+
+        std::string q_final = query.str();
+
+        r = sqlite3_prepare(db, q_final.c_str(), q_final.length(), &stmt, &pz);
+
+        if (r != SQLITE_OK) 
+            throw std::runtime_error(fmt::format("Unable to prepare database query: {}", sqlite3_errmsg(db)));
+
+        return stmt;
+    }
+
+    bool append = false;
+    query << " WHERE (";
+
+    for (auto i : bindings) {
+        if (append)
+            query << " AND ";
+        append = true;
+
+        query << i->get_query();
+    }
+
+    query << ");";
+
+    std::string q_final = query.str();
+
+    r = sqlite3_prepare(db, q_final.c_str(), q_final.length(), &stmt, &pz);
+
+    if (r != SQLITE_OK) 
+        throw std::runtime_error(fmt::format("Unable to prepare database query: {}", sqlite3_errmsg(db)));
+
+    int fpos = 1;
+    for (auto i : bindings) {
+        r = i->bind_query(stmt, fpos);
+
+        if (r != SQLITE_OK)
+            throw std::runtime_error(fmt::format("Unable to bind field {} to query: {}", fpos, 
+                        sqlite3_errmsg(db)));
+
+        fpos++;
+    }
+
+    return stmt;
+}

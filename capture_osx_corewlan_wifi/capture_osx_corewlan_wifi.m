@@ -50,11 +50,8 @@
 
 #include "../config.h"
 
-#include "../simple_datasource_proto.h"
 #include "../capture_framework.h"
-
 #include "../interface_control.h"
-
 #include "../wifi_ht_channels.h"
 
 #import <Foundation/Foundation.h>
@@ -366,7 +363,7 @@ int chancontrol_callback(kis_capture_handler_t *caph, uint32_t seqno, void *priv
                 chanstr, errstr);
 
         if (seqno == 0) {
-            cf_send_error(caph, msg);
+            cf_send_error(caph, 0, msg);
         }
 
         return -1;
@@ -377,7 +374,7 @@ int chancontrol_callback(kis_capture_handler_t *caph, uint32_t seqno, void *priv
 
 
 int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
-        char *msg, char **uuid, simple_cap_proto_frame_t *frame,
+        char *msg, char **uuid, KismetExternal__Command *frame,
         cf_params_interface_t **ret_interface,
         cf_params_spectrum_t **ret_spectrum) {
     local_wifi_t *local_wifi = (local_wifi_t *) caph->userdata;
@@ -433,20 +430,22 @@ int probe_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition
 
     /* Make a spoofed, but consistent, UUID based on the adler32 of the interface name 
      * and the mac address of the device */
-    snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
-            adler32_csum((unsigned char *) "kismet_cap_osx_corewlan_wifi", 
-                strlen("kismet_cap_osx_corewlan_wifi")) & 0xFFFFFFFF,
-            hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
-            hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
-    *uuid = strdup(errstr);
-
-    printf("probe returned\n");
+    if ((placeholder_len = cf_find_flag(&placeholder, "uuid", definition)) > 0) {
+        *uuid = strdup(placeholder);
+    } else {
+        snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
+                adler32_csum((unsigned char *) "kismet_cap_osx_corewlan_wifi", 
+                    strlen("kismet_cap_osx_corewlan_wifi")) & 0xFFFFFFFF,
+                hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
+                hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
+        *uuid = strdup(errstr);
+    }
 
     return 1;
 }
 
 int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
-        char *msg, uint32_t *dlt, char **uuid, simple_cap_proto_frame_t *frame,
+        char *msg, uint32_t *dlt, char **uuid, KismetExternal__Command *frame,
         cf_params_interface_t **ret_interface,
         cf_params_spectrum_t **ret_spectrum) {
     
@@ -524,12 +523,16 @@ int open_callback(kis_capture_handler_t *caph, uint32_t seqno, char *definition,
 
     /* Make a spoofed, but consistent, UUID based on the adler32 of the interface name 
      * and the mac address of the device */
-    snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
-            adler32_csum((unsigned char *) "kismet_cap_osx_corewlan_wifi", 
-                strlen("kismet_cap_osx_corewlan_wifi")) & 0xFFFFFFFF,
-            hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
-            hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
-    *uuid = strdup(errstr);
+    if ((placeholder_len = cf_find_flag(&placeholder, "uuid", definition)) > 0) {
+        *uuid = strdup(placeholder);
+    } else {
+        snprintf(errstr, STATUS_MAX, "%08X-0000-0000-0000-%02X%02X%02X%02X%02X%02X",
+                adler32_csum((unsigned char *) "kismet_cap_osx_corewlan_wifi", 
+                    strlen("kismet_cap_osx_corewlan_wifi")) & 0xFFFFFFFF,
+                hwaddr[0] & 0xFF, hwaddr[1] & 0xFF, hwaddr[2] & 0xFF,
+                hwaddr[3] & 0xFF, hwaddr[4] & 0xFF, hwaddr[5] & 0xFF);
+        *uuid = strdup(errstr);
+    }
 
     local_wifi->cap_interface = strdup(local_wifi->interface);
 
@@ -669,9 +672,10 @@ void pcap_dispatch_cb(u_char *user, const struct pcap_pkthdr *header,
         if ((ret = cf_send_data(caph, 
                         NULL, NULL, NULL,
                         header->ts, 
+                        local_wifi->datalink_type,
                         header->caplen, (uint8_t *) data)) < 0) {
             pcap_breakloop(local_wifi->pd);
-            cf_send_error(caph, "unable to send DATA frame");
+            cf_send_error(caph, 0, "unable to send DATA frame");
             cf_handler_spindown(caph);
         } else if (ret == 0) {
             /* Go into a wait for the write buffer to get flushed */
@@ -702,7 +706,7 @@ void capture_thread(kis_capture_handler_t *caph) {
             local_wifi->cap_interface, 
             strlen(pcap_errstr) == 0 ? "interface closed" : pcap_errstr );
 
-    cf_send_error(caph, errstr);
+    cf_send_error(caph, 0, errstr);
 
     ifret = ifconfig_get_flags(local_wifi->cap_interface, iferrstr, &ifflags);
 
@@ -710,7 +714,7 @@ void capture_thread(kis_capture_handler_t *caph) {
         snprintf(errstr, PCAP_ERRBUF_SIZE, "Interface '%s' no longer appears to be up; "
                 "This can happen when it is unplugged, or another service like DHCP or "
                 "has taken over and shut it down on us.", local_wifi->cap_interface);
-        cf_send_error(caph, errstr);
+        cf_send_error(caph, 0, errstr);
     }
 
     cf_handler_spindown(caph);

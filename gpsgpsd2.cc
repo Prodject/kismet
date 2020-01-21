@@ -26,117 +26,177 @@
 #include "pollabletracker.h"
 #include "timetracker.h"
 
-GPSGpsdV2::GPSGpsdV2(GlobalRegistry *in_globalreg, SharedGpsBuilder in_builder) : 
-    KisGps(in_globalreg, in_builder) {
+kis_gps_gpsd_v2::kis_gps_gpsd_v2(shared_gps_builder in_builder) : 
+    kis_gps(in_builder),
+    tcpinterface {
+        [this](size_t in_amt) { 
+            buffer_available(in_amt);
+        },
+        [this](std::string in_err) {
+            buffer_error(in_err);
+        }
+    } {
 
-        // Defer making buffers until open, because we might be used to make a 
-        // builder instance
+    // Defer making buffers until open, because we might be used to make a 
+    // builder instance
 
-        tcphandler = NULL;
+    tcphandler = NULL;
 
-        last_heading_time = time(0);
+    last_heading_time = time(0);
 
-        poll_mode = 0;
-        si_units = 0;
-        si_raw = 0;
+    poll_mode = 0;
+    si_units = 0;
+    si_raw = 0;
 
-        pollabletracker = 
-            Globalreg::FetchGlobalAs<PollableTracker>(globalreg, "POLLABLETRACKER");
+    last_data_time = time(0);
 
-        auto timetracker = 
-            Globalreg::FetchGlobalAs<Timetracker>(globalreg, "TIMETRACKER");
-        error_reconnect_timer = 
-            timetracker->RegisterTimer(SERVER_TIMESLICES_SEC * 10, NULL, 1,
-                    [this](int) -> int {
-                    if (get_device_connected()) 
-                    return 1;
+    pollabletracker = 
+        Globalreg::fetch_mandatory_global_as<pollable_tracker>("POLLABLETRACKER");
 
-                    open_gps(get_gps_definition());
+    auto timetracker = Globalreg::fetch_mandatory_global_as<time_tracker>("TIMETRACKER");
 
-                    return 1;
-                    });
-    }
+    error_reconnect_timer = 
+        timetracker->register_timer(SERVER_TIMESLICES_SEC * 10, NULL, 1,
+                [this](int) -> int {
+                {
+                    local_shared_locker l(gps_mutex);
 
-GPSGpsdV2::~GPSGpsdV2() {
-    local_eol_locker lock(&gps_mutex);
+                    if (!get_gps_reconnect())
+                        return 1;
 
-    pollabletracker->RemovePollable(tcpclient);
+                    if (tcpclient != nullptr && tcpclient->get_connected())
+                        return 1;
+                }
 
-    delete(tcphandler);
+                open_gps(get_gps_definition());
+                return 1;
 
-    std::shared_ptr<Timetracker> timetracker = 
-        Globalreg::FetchGlobalAs<Timetracker>(globalreg, "TIMETRACKER");
-    timetracker->RemoveTimer(error_reconnect_timer);
+                });
+
+    data_timeout_timer =
+        timetracker->register_timer(SERVER_TIMESLICES_SEC * 10, NULL, 1,
+                [this](int) -> int {
+
+                {
+                    local_shared_locker l(gps_mutex);
+
+                    if (tcpclient == nullptr || (tcpclient != nullptr && !tcpclient->get_connected()))
+                        return 1;
+                }
+
+                if (time(0) - last_data_time > 30) {
+                    if (get_gps_reconnect())
+                        _MSG_ERROR("GPSDv2 didn't get data from gpsd in over 30 seconds, reconnecting "
+                                "to GPSD server.");
+                    else
+                        _MSG_ERROR("GPSDv2 didn't get data from gpsd in over 30 seconds, disconnecting");
+
+                    tcpclient->disconnect();
+                    set_int_device_connected(false);
+                }
+
+                return 1;
+                });
+
 }
 
-bool GPSGpsdV2::open_gps(std::string in_opts) {
-    local_locker lock(&gps_mutex);
+kis_gps_gpsd_v2::~kis_gps_gpsd_v2() {
+    if (tcpclient != nullptr) {
+        pollabletracker->remove_pollable(tcpclient);
+    }
 
-    if (!KisGps::open_gps(in_opts))
+    tcpclient.reset();
+
+    if (tcphandler != nullptr) {
+        tcphandler->remove_read_buffer_interface();
+    }
+
+    tcphandler.reset();
+
+    auto timetracker = Globalreg::FetchGlobalAs<time_tracker>("TIMETRACKER");
+    if (timetracker != nullptr) {
+        timetracker->remove_timer(error_reconnect_timer);
+        timetracker->remove_timer(data_timeout_timer);
+    }
+}
+
+bool kis_gps_gpsd_v2::open_gps(std::string in_opts) {
+    local_locker lock(gps_mutex);
+
+    if (!kis_gps::open_gps(in_opts))
         return false;
 
     set_int_device_connected(false);
 
-    // Delete any existing serial interface before we parse options
-    if (tcphandler != NULL) {
-        delete tcphandler;
-        tcphandler = NULL;
+    // Disconnect the client if it still exists
+    if (tcpclient != nullptr) {
+        tcpclient->disconnect();
     }
 
-    if (tcpclient != NULL) {
-        pollabletracker->RemovePollable(tcpclient);
-        tcpclient.reset();
+    // Clear the buffers
+    if (tcphandler != nullptr) {
+        tcphandler->clear_read_buffer();
+        tcphandler->clear_write_buffer();
     }
 
     std::string proto_host;
     std::string proto_port_s;
     unsigned int proto_port;
 
-    proto_host = FetchOpt("host", source_definition_opts);
-    proto_port_s = FetchOpt("port", source_definition_opts);
+    proto_host = fetch_opt("host", source_definition_opts);
+    proto_port_s = fetch_opt("port", source_definition_opts);
 
     if (proto_host == "") {
-        _MSG("GPSGpsdV2 expected host= option, none found.", MSGFLAG_ERROR);
+        _MSG("kis_gps_gpsd_v2 expected host= option, none found.", MSGFLAG_ERROR);
         return -1;
     }
 
     if (proto_port_s != "") {
         if (sscanf(proto_port_s.c_str(), "%u", &proto_port) != 1) {
-            _MSG("GPSGpsdV2 expected port in port= option.", MSGFLAG_ERROR);
+            _MSG("kis_gps_gpsd_v2 expected port in port= option.", MSGFLAG_ERROR);
             return -1;
         }
     } else {
         proto_port = 2947;
-        _MSG("GPSGpsdV2 defaulting to port 2947, set the port= option if "
+        _MSG("kis_gps_gpsd_v2 defaulting to port 2947, set the port= option if "
                 "your gpsd is on a different port", MSGFLAG_INFO);
     }
 
-    // GPSD network connection writes data as well as reading, but most of it is
-    // inbound data
-    tcphandler = new BufferHandler<RingbufV2>(4096, 512);
-    // Set the read handler to us
-    tcphandler->SetReadBufferInterface(this);
-    // Link it to a tcp connection
-    tcpclient.reset(new TcpClientV2(globalreg, tcphandler));
-    tcpclient->Connect(proto_host, proto_port);
+    // Do the first time setup
+    if (tcphandler == nullptr) {
+        // GPSD network connection writes data as well as reading, but most of it is
+        // inbound data
+        tcphandler = std::make_shared<buffer_handler<ringbuf_v2>>(4096, 512, gps_mutex);
+        tcphandler->set_read_buffer_interface(&tcpinterface);
+    }
 
-    // Register a pollable event
-    pollabletracker->RegisterPollable(std::static_pointer_cast<Pollable>(tcpclient));
+    if (tcpclient == nullptr) {
+        // Link it to a tcp connection
+        tcpclient = std::make_shared<tcp_client_v2>(Globalreg::globalreg, tcphandler);
+        pollabletracker->register_pollable(std::static_pointer_cast<kis_pollable>(tcpclient));
+    }
 
     host = proto_host;
     port = proto_port;
 
-    std::stringstream msg;
-    msg << "GPSGpsdV2 connecting to GPSD server on " << host << ":" << port;
-    _MSG(msg.str(), MSGFLAG_INFO);
+    // Reset the time counter
+    last_data_time = time(0);
 
-    set_int_device_connected(true);
+    // We're not connected until we get data
+    set_int_device_connected(0);
+
+    // Connect
+    tcpclient->connect(proto_host, proto_port);
 
     return 1;
 }
 
-bool GPSGpsdV2::get_location_valid() {
-    local_locker lock(&gps_mutex);
+bool kis_gps_gpsd_v2::get_location_valid() {
+    local_shared_locker lock(gps_mutex);
+
+    if (!get_device_connected()) {
+        return false;
+    }
 
     if (gps_location == NULL) {
         return false;
@@ -147,31 +207,46 @@ bool GPSGpsdV2::get_location_valid() {
     }
 
     // If a location is older than 10 seconds, it's no good anymore
-    if (globalreg->timestamp.tv_sec - gps_location->tv.tv_sec > 10) {
+    if (time(0) - gps_location->tv.tv_sec > 10) {
         return false;
     }
 
     return true;
 }
 
-bool GPSGpsdV2::get_device_connected() {
-    local_locker lock(&gps_mutex);
-
-    if (tcpclient == NULL)
-        return false;
-
-    return tcpclient->FetchConnected();
-}
-
-void GPSGpsdV2::BufferAvailable(size_t in_amt) {
-    local_locker lock(&gps_mutex);
+void kis_gps_gpsd_v2::buffer_available(size_t in_amt) {
+    local_locker lock(gps_mutex);
 
     size_t buf_sz;
     char *buf;
 
+    // We defer logging that we saw new data until we see a complete record, in case 
+    // one of the weird failure conditions of GPSD is to send a partial record
+
+    if (tcphandler->get_read_buffer_available() == 0) {
+        if (get_gps_reconnect())
+            _MSG_ERROR("GPSDv2 read buffer filled without getting a valid record; "
+                    "disconnecting and reconnecting.");
+        else
+            _MSG_ERROR("GPSDv2 read buffer filled without getting a valid record; disconnecting.");
+
+        tcpclient->disconnect();
+        set_int_device_connected(false);
+        return;
+    }
+
+    // Use data availability as the connected status since tcp poll is currently
+    // hidden from us
+    {
+        if (!get_device_connected()) {
+            _MSG_INFO("GPSGPSD connected to GPSD server on {}:{}", host, port);
+            set_int_device_connected(true);
+        }
+    }
+
     // Peek at all the data we have available
-    buf_sz = tcphandler->PeekReadBufferData((void **) &buf, 
-            tcphandler->GetReadBufferAvailable());
+    buf_sz = tcphandler->peek_read_buffer_data((void **) &buf, 
+            tcphandler->get_read_buffer_available());
 
     // Aggregate into a new location; then copy into the main location
     // depending on what we found.  Locations can come in multiple sentences
@@ -182,9 +257,10 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
     bool set_speed;
     bool set_fix;
     bool set_heading;
+    bool set_error;
 
-    std::vector<std::string> inptok = StrTokenize(std::string(buf, buf_sz), "\n", 0);
-    tcphandler->PeekFreeReadBufferData(buf);
+    std::vector<std::string> inptok = str_tokenize(std::string(buf, buf_sz), "\n", 0);
+    tcphandler->peek_free_read_buffer_data(buf);
 
     if (inptok.size() < 1) {
         return;
@@ -198,10 +274,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
     for (unsigned int it = 0; it < inptok.size(); it++) {
         // Consume the data from the ringbuffer
-        tcphandler->ConsumeReadBufferData(inptok[it].length() + 1);
-
-        // Trip the garbage out of it
-        inptok[it] = StrPrintable(inptok[it]);
+        tcphandler->consume_read_buffer_data(inptok[it].length() + 1);
 
         // We don't know what we're going to get from GPSD.  If it starts with 
         // { then it probably is json, try to parse it
@@ -215,9 +288,9 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
                 std::string msg_class = json["class"].asString();
 
                 if (msg_class == "VERSION") {
-                    std::string version  = MungeToPrintable(json["release"].asString());
+                    std::string version  = munge_to_printable(json["release"].asString());
 
-                    _MSG("GPSGpsdV2 connected to a JSON-enabled GPSD version " +
+                    _MSG("kis_gps_gpsd_v2 connected to a JSON-enabled GPSD version " +
                             version + ", turning on JSON mode", MSGFLAG_INFO);
 
                     // Set JSON mode
@@ -228,9 +301,9 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
                     // Send a JSON message that we want future communication in JSON
                     std::string json_msg = "?WATCH={\"json\":true};\n";
 
-                    if (tcphandler->PutWriteBufferData((void *) json_msg.c_str(), 
+                    if (tcphandler->put_write_buffer_data((void *) json_msg.c_str(), 
                                 json_msg.length(), true) < json_msg.length()) {
-                        _MSG("GPSGpsdV2 could not not write JSON enable command",
+                        _MSG("kis_gps_gpsd_v2 could not not write JSON enable command",
                                 MSGFLAG_ERROR);
                     }
                 } else if (msg_class == "TPV") {
@@ -247,6 +320,21 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
                         }
                     } 
 
+                    if (json.isMember("epx")) {
+                        new_location->error_x = json["epx"].asDouble();
+                        set_error = true;
+                    }
+
+                    if (json.isMember("epy")) {
+                        new_location->error_y = json["epy"].asDouble();
+                        set_error = true;
+                    }
+
+                    if (json.isMember("epv")) {
+                        new_location->error_v = json["epv"].asDouble();
+                        set_error = true;
+                    }
+
                     if (set_fix && new_location->fix >= 2) {
                         // If we have LAT and LON, use them
                         if (json.isMember("lat") && json.isMember("lon")) {
@@ -255,21 +343,6 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
                             set_lat_lon = true;
                         }
-
-#if 0
-                        // If we have HDOP and VDOP, use them
-                        n = JSON_dict_get_number(json, "epx", err);
-                        if (err.length() == 0) {
-                            in_hdop = n;
-
-                            n = JSON_dict_get_number(json, "epy", err);
-                            if (err.length() == 0) {
-                                in_vdop = n;
-
-                                use_dop = 1;
-                            }
-                        }
-#endif
 
                         if (json.isMember("track")) {
                             new_location->heading = json["track"].asDouble();
@@ -338,8 +411,11 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
                 }
 
             } catch (std::exception& e) {
-                _MSG(std::string("GPSGpsdV2 - Invalid JSON block from GPSD: ") + 
-                        std::string(e.what()), MSGFLAG_ERROR);
+                _MSG_ERROR("GPSGPSDv2 got an invalid JSON record from GPSD: '{}'", e.what());
+
+                tcpclient->disconnect();
+                set_int_device_connected(false);
+
                 continue;
             }
         } else if (poll_mode == 0 && inptok[it] == "GPSD") {
@@ -351,9 +427,9 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
             poll_mode = 1;
 
             std::string init_cmd = "L\n";
-            if (tcphandler->PutWriteBufferData((void *) init_cmd.c_str(), 
+            if (tcphandler->put_write_buffer_data((void *) init_cmd.c_str(), 
                         init_cmd.length(), true) < init_cmd.length()) {
-                _MSG("GPSGpsdV2 could not not write NMEA enable command",
+                _MSG("kis_gps_gpsd_v2 could not not write NMEA enable command",
                         MSGFLAG_ERROR);
             }
 
@@ -364,9 +440,9 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
             // have to detect this version and kick it into debug R=1 mode
             // and do NMEA ourselves.
             std::string cmd = "R=1\n";
-            if (tcphandler->PutWriteBufferData((void *) cmd.c_str(), 
+            if (tcphandler->put_write_buffer_data((void *) cmd.c_str(), 
                         cmd.length(), true) < cmd.length()) {
-                _MSG("GPSGpsdV2 could not not write NMEA enable command",
+                _MSG("kis_gps_gpsd_v2 could not not write NMEA enable command",
                         MSGFLAG_ERROR);
             }
 
@@ -374,7 +450,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
             si_raw = 1;
         } else if (poll_mode < 10 && inptok[it].substr(0, 7) == "GPSD,L=") {
             // Look for the version response
-            std::vector<std::string> lvec = StrTokenize(inptok[it], " ");
+            std::vector<std::string> lvec = str_tokenize(inptok[it], " ");
             int gma, gmi;
 
             if (lvec.size() < 3) {
@@ -398,44 +474,44 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
             // This has been merged into one command because gpsd apparently
             // silently drops the second command sent too quickly
             std::string watch_cmd = "J=1,W=1,R=1\n";
-            if (tcphandler->PutWriteBufferData((void *) watch_cmd.c_str(), 
+            if (tcphandler->put_write_buffer_data((void *) watch_cmd.c_str(), 
                         watch_cmd.length(), true) < watch_cmd.length()) {
-                _MSG("GPSGpsdV2 could not not write GPSD watch command",
+                _MSG("kis_gps_gpsd_v2 could not not write GPSD watch command",
                         MSGFLAG_ERROR);
             }
 
             // Go into poll mode
             std::string poll_cmd = "PAVM\n";
-            if (tcphandler->PutWriteBufferData((void *) poll_cmd.c_str(), 
+            if (tcphandler->put_write_buffer_data((void *) poll_cmd.c_str(), 
                         poll_cmd.length(), true) < poll_cmd.length()) {
-                _MSG("GPSGpsdV2 could not not write GPSD watch command",
+                _MSG("kis_gps_gpsd_v2 could not not write GPSD watch command",
                         MSGFLAG_ERROR);
             }
 
 
         } else if (poll_mode < 10 && inptok[it].substr(0, 7) == "GPSD,P=") {
-            // Poll lines
-            std::vector<std::string> pollvec = StrTokenize(inptok[it], ",");
+            // pollable_poll lines
+            std::vector<std::string> pollvec = str_tokenize(inptok[it], ",");
 
             if (pollvec.size() < 5) {
                 continue;
             }
 
-            if (sscanf(pollvec[1].c_str(), "P=%lf %lf", 
+            if (pollvec[1].substr(0, 2) == "P=" && sscanf(pollvec[1].c_str(), "P=%lf %lf", 
                         &(new_location->lat), &(new_location->lon)) != 2) {
                 continue;
             }
 
-            if (sscanf(pollvec[4].c_str(), "M=%d", &(new_location->fix)) != 1) {
+            if (pollvec[4].substr(0, 2) == "M=" && sscanf(pollvec[4].c_str(), "M=%d", &(new_location->fix)) != 1) {
                 continue;
             }
 
-            if (sscanf(pollvec[2].c_str(), "A=%lf", &(new_location->alt)) != 1)
+            if (pollvec[2].substr(0, 2) == "A=" && sscanf(pollvec[2].c_str(), "A=%lf", &(new_location->alt)) != 1)
                 set_alt = false;
             else
                 set_alt = true;
 
-            if (sscanf(pollvec[3].c_str(), "V=%lf", &(new_location->speed)) != 1)
+            if (pollvec[3].substr(0, 2) == "V=" && sscanf(pollvec[3].c_str(), "V=%lf", &(new_location->speed)) != 1)
                 set_speed = false;
             else 
                 set_speed = true;
@@ -452,7 +528,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
         } else if (poll_mode < 10 && inptok[it].substr(0, 7) == "GPSD,O=") {
             // Look for O= watch lines
-            std::vector<std::string> ggavec = StrTokenize(inptok[it], " ");
+            std::vector<std::string> ggavec = str_tokenize(inptok[it], " ");
 
             if (ggavec.size() < 15) {
                 continue;
@@ -506,7 +582,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
             set_fix = true;
             set_lat_lon = true;
         } else if (poll_mode < 10 && si_raw && inptok[it].substr(0, 6) == "$GPGSA") {
-            std::vector<std::string> savec = StrTokenize(inptok[it], ",");
+            std::vector<std::string> savec = str_tokenize(inptok[it], ",");
 
             if (savec.size() != 18)
                 continue;
@@ -516,7 +592,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
             set_fix = true;
         } else if (si_raw && inptok[it].substr(0, 6) == "$GPVTG") {
-            std::vector<std::string> vtvec = StrTokenize(inptok[it], ",");
+            std::vector<std::string> vtvec = str_tokenize(inptok[it], ",");
 
             if (vtvec.size() != 10)
                 continue;
@@ -526,7 +602,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
             set_speed = true;
         } else if (poll_mode < 10 && si_raw && inptok[it].substr(0, 6) == "$GPGGA") {
-            std::vector<std::string> gavec = StrTokenize(inptok[it], ",");
+            std::vector<std::string> gavec = str_tokenize(inptok[it], ",");
             int tint;
             float tfloat;
 
@@ -572,7 +648,7 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
             gps_connected = 1;
 
-            vector<string> svvec = StrTokenize(inptok[it], ",");
+            vector<string> svvec = str_tokenize(inptok[it], ",");
             GPSCore::sat_pos sp;
 
             if (svvec.size() < 6)
@@ -600,8 +676,15 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
 
             continue;
 #endif
-        } 
+        } else {
+            continue;
+        }
     }
+
+    // If we've gotten this far in the parser, we've gotten usable data, even if it's not
+    // actionable data (ie status w/ no valid signal is OK, but mangled unparsable nonsense
+    // isn't.)
+    last_data_time = time(0);
 
     // fprintf(stderr, "gps set loc %d alt %d spd %d fix %d heading %d\n", set_lat_lon, set_alt, set_speed, set_fix, set_heading);
 
@@ -638,12 +721,18 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
             gps_location->heading = new_location->heading;
         }
 
+        if (set_error) {
+            gps_location->error_x = new_location->error_x;
+            gps_location->error_y = new_location->error_y;
+            gps_location->error_v = new_location->error_v;
+        }
+
         gettimeofday(&(gps_location->tv), NULL);
 
-        if (!set_heading && globalreg->timestamp.tv_sec - last_heading_time > 5 &&
+        if (!set_heading && time(0) - last_heading_time > 5 &&
                 gps_last_location->fix >= 2) {
             gps_location->heading = 
-                GpsCalcHeading(gps_location->lat, gps_location->lon, 
+                gps_calc_heading(gps_location->lat, gps_location->lon, 
                         gps_last_location->lat, gps_last_location->lon);
             last_heading_time = gps_location->tv.tv_sec;
         }
@@ -653,13 +742,20 @@ void GPSGpsdV2::BufferAvailable(size_t in_amt) {
     update_locations();
 }
 
-void GPSGpsdV2::BufferError(std::string in_error) {
-    local_locker lock(&gps_mutex);
+void kis_gps_gpsd_v2::buffer_error(std::string in_error) {
+    local_locker lock(gps_mutex);
+
+    set_int_device_connected(false);
+
+    // Delete any existing interface before we parse options
+    if (tcpclient != NULL) {
+        pollabletracker->remove_pollable(tcpclient);
+        tcpclient.reset();
+    }
 
     _MSG("GPS device '" + get_gps_name() + "' encountered a network error: " + in_error,
             MSGFLAG_ERROR);
 
-    set_int_device_connected(false);
 }
 
 

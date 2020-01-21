@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -29,6 +29,7 @@
 #include "globalregistry.h"
 #include "buffer_handler.h"
 #include "pollable.h"
+#include "kis_mutex.h"
 
 // New TCP client code.
 //
@@ -38,29 +39,33 @@
 // We don't have to implement a buffer interface directly, because we check the
 // write buffer during the poll() sequence.  The consumer will use the buffer
 // interface for reading data coming in from the client.
-class TcpClientV2 : public Pollable {
+class tcp_client_v2 : public kis_pollable {
 public:
-    TcpClientV2(GlobalRegistry *in_globalreg, BufferHandlerGeneric *in_rbhandler);
-    virtual ~TcpClientV2();
+    tcp_client_v2(global_registry *in_globalreg, std::shared_ptr<buffer_handler_generic> in_rbhandler);
+    virtual ~tcp_client_v2();
+
+    virtual void set_mutex(std::shared_ptr<kis_recursive_timed_mutex> in_parent);
 
     // Connect to a host, returns 0 if connection initiated and negative if fail
-    int Connect(std::string in_host, unsigned int in_port);
-    void Disconnect();
+    int connect(std::string in_host, unsigned int in_port);
+    void disconnect();
 
-    bool FetchConnected();
+    bool get_connected();
 
-    // Pollable interface
-    virtual int MergeSet(int in_max_fd, fd_set *out_rset, fd_set *out_wset);
-    virtual int Poll(fd_set& in_rset, fd_set& in_wset);
+    // kis_pollable interface
+    virtual int pollable_merge_set(int in_max_fd, fd_set *out_rset, fd_set *out_wset);
+    virtual int pollable_poll(fd_set& in_rset, fd_set& in_wset);
 
 protected:
-    GlobalRegistry *globalreg;
-    BufferHandlerGeneric *handler;
+    global_registry *globalreg;
+    std::shared_ptr<buffer_handler_generic> handler;
 
-    bool pending_connect;
-    bool connected;
+    std::shared_ptr<kis_recursive_timed_mutex> tcp_mutex;
 
-    int cli_fd;
+    std::atomic<bool> pending_connect;
+    std::atomic<bool> connected;
+
+    std::atomic<int> cli_fd;
     struct sockaddr_in client_sock, local_sock;
     struct hostent *client_host;
 

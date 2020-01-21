@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -19,11 +19,19 @@
 #ifndef __RINGBUF2_H__
 #define __RINGBUF2_H__
 
+#include "config.h"
+
 #include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
+
 #include <mutex>
+
 #include "buffer_handler.h"
+
+#ifdef SYS_LINUX
+// #define USE_MMAP_RBUF
+#endif
 
 // #define PROFILE_RINGBUFV2   1
 
@@ -31,10 +39,10 @@
 // Kismet as the rewrite continues
 //
 // Automatically thread locks locally to prevent multiple operations overlapping
-class RingbufV2 : public CommonBuffer {
+class ringbuf_v2 : public common_buffer {
 public:
-    RingbufV2(size_t in_sz);
-    virtual ~RingbufV2();
+    ringbuf_v2(size_t in_sz);
+    virtual ~ringbuf_v2();
 
     // Reset a buffer
     virtual void clear();
@@ -64,15 +72,22 @@ public:
 
 protected:
     unsigned char *buffer;
+#ifdef USE_MMAP_RBUF
+    void *mmap_region0;
+    void *mmap_region1;
+
+    int mmap_fd;
+#endif
+
     // Total size
-    size_t buffer_sz;
+    std::atomic<size_t> buffer_sz;
     // Where reads start
-    size_t start_pos;
+    std::atomic<size_t> start_pos;
     // Length of data currently in buffer
-    size_t length;
+    std::atomic<size_t> length;
 
     // Do we need to free our peeked or committed data?
-    bool free_peek, free_commit;
+    std::atomic<bool> free_peek, free_commit;
 
 #ifdef PROFILE_RINGBUFV2 
     size_t zero_copy_w_bytes, zero_copy_r_bytes, copy_w_bytes, copy_r_bytes, last_profile_bytes;

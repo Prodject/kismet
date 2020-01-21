@@ -57,6 +57,13 @@
         - E0:B9:4D:00:00:00/FF:FF:FF:00:00:00
 
 - uav:
+    id: 360lflight
+    name: 360-L Flight
+    ssid: ^360-L Flight-.*
+    mac:
+        - 4C:0F:C7:00:00:00/FF:FF:FF:00:00:00
+
+- uav:
     id: 3drsolo
     name: 3DRobotics
     model: Solo
@@ -94,7 +101,23 @@
     model: Spark RC
     ssid: ^Spark-RC-.*
     mac:
-        - 60:60:1F:00:00:00/FF:FF:FF:00:00:00 
+        - 60:60:1F:00:00:00/FF:FF:FF:00:00:00
+
+- uav:
+    id: dji_tello
+    name: DJI
+    model: Tello
+    ssid: ^TELLO.*
+    mac:
+        - 60:60:1F:00:00:00/FF:FF:FF:00:00:00
+
+- uav:
+    id: dji_osmo
+    name: DJI
+    model: Osmo
+    ssid: ^OSMO_.*
+    mac:
+        - 60:60:1F:00:00:00/FF:FF:FF:00:00:00
 
 - uav:
     id: propel_hd

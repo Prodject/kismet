@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -22,33 +22,52 @@
 #include "config.h"
 
 
-#include "kis_mutex.h"
-#include "packetchain.h"
 #include "globalregistry.h"
+#include "kis_mutex.h"
 #include "kis_net_microhttpd.h"
-#include "tracked_location.h"
+#include "packet.h"
+#include "packetchain.h"
+#include "trackedlocation.h"
 
-class KisGpsBuilder;
-typedef std::shared_ptr<KisGpsBuilder> SharedGpsBuilder;
+class kis_gps_builder;
+typedef std::shared_ptr<kis_gps_builder> shared_gps_builder;
 
-class KisGps;
-typedef std::shared_ptr<KisGps> SharedGps;
+class kis_gps;
+typedef std::shared_ptr<kis_gps> shared_gps;
 
 // Packet info attached to each packet, if there isn't already GPS info present
+
+// Optional merge flags for partial records
+#define GPS_PACKINFO_MERGE_LOC      (1 << 1)
+#define GPS_PACKINFO_MERGE_ALT      (1 << 2)
+#define GPS_PACKINFO_MERGE_SPEED    (1 << 3)
+#define GPS_PACKINFO_MERGE_HEADING  (1 << 4)
+#define GPS_PACKINFO_MERGE_REST     (1 << 128)
+
 class kis_gps_packinfo : public packet_component {
 public:
-	kis_gps_packinfo() {
-		self_destruct = 1;
+    kis_gps_packinfo() {
+        self_destruct = 1;
+
+        merge_partial = false;
+        merge_flags = 0;
+
         lat = lon = alt = speed = heading = 0;
         precision = 0;
-		fix = 0;
+        fix = 0;
         tv.tv_sec = 0;
         tv.tv_usec = 0;
-	}
+        error_x = 0;
+        error_y = 0;
+        error_v = 0;
+    }
 
     kis_gps_packinfo(kis_gps_packinfo *src) {
         if (src != NULL) {
             self_destruct = src->self_destruct;
+
+            merge_partial = src->merge_partial;
+            merge_flags = src->merge_flags;
 
             lat = src->lat;
             lon = src->lon;
@@ -64,9 +83,9 @@ public:
         }
     }
 
-    std::shared_ptr<kis_tracked_location_triplet> as_tracked_triplet(GlobalRegistry *globalreg) {
-        std::shared_ptr<kis_tracked_location_triplet> 
-            r(new kis_tracked_location_triplet(globalreg, 0));
+    std::shared_ptr<kis_tracked_location_triplet> as_tracked_triplet() {
+        std::shared_ptr<kis_tracked_location_triplet> r =
+            std::make_shared<kis_tracked_location_triplet>();
 
         r->set_lat(lat);
         r->set_lon(lon);
@@ -75,6 +94,9 @@ public:
         r->set_heading(heading);
         r->set_fix(fix);
         r->set_valid(fix >= 2);
+        r->set_error_x(error_x);
+        r->set_error_y(error_y);
+        r->set_error_v(error_v);
         r->set_time_sec(tv.tv_sec);
         r->set_time_usec(tv.tv_usec);
 
@@ -90,8 +112,17 @@ public:
     // If we know it, how accurate our location is, in meters
     double precision;
 
+    // Should handlers merge partial info (speed and alt) without 
+    // location info?  Used for sources like adsb which receive location
+    // in multiple records
+    bool merge_partial;
+    uint8_t merge_flags;
+
     // If we know it, 2d vs 3d fix
     int fix;
+
+    // If we know error values...
+    double error_x, error_y, error_v;
 
     struct timeval tv;
 
@@ -102,35 +133,46 @@ public:
     std::string gpsname;
 };
 
+// Packet component used to tell other components NOT to include gps info
+// from the live GPS
+class kis_no_gps_packinfo : public packet_component {
+public:
+    kis_no_gps_packinfo() {
+        self_destruct = 1;
+    }
+};
+
 /* GPS manager which handles configuring GPS sources and deciding which one
  * is going to be used */
-class GpsTracker : public Kis_Net_Httpd_CPPStream_Handler, public LifetimeGlobal {
+class gps_tracker : public kis_net_httpd_cppstream_handler, public lifetime_global {
 public:
-    static std::shared_ptr<GpsTracker> create_gpsmanager(GlobalRegistry *in_globalreg) {
-        std::shared_ptr<GpsTracker> mon(new GpsTracker(in_globalreg));
-        in_globalreg->RegisterLifetimeGlobal(mon);
-        in_globalreg->InsertGlobal("GPSTRACKER", mon);
+    static std::string global_name() { return "GPSTRACKER"; }
+
+    static std::shared_ptr<gps_tracker> create_gpsmanager() {
+        std::shared_ptr<gps_tracker> mon(new gps_tracker());
+        Globalreg::globalreg->register_lifetime_global(mon);
+        Globalreg::globalreg->insert_global(global_name(), mon);
         return mon;
     }
 
 private:
-    GpsTracker(GlobalRegistry *in_globalreg);
+    gps_tracker();
 
 public:
-    virtual ~GpsTracker();
+    virtual ~gps_tracker();
 
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
+    virtual bool httpd_verify_path(const char *path, const char *method);
 
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+    virtual void httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
             size_t *upload_data_size, std::stringstream &stream);
 
     // Register a gps builer prototype
-    void register_gps_builder(SharedGpsBuilder in_builder);
+    void register_gps_builder(shared_gps_builder in_builder);
 
     // Create a GPS from a definition string
-    std::shared_ptr<KisGps> create_gps(std::string in_definition);
+    std::shared_ptr<kis_gps> create_gps(std::string in_definition);
 
     // Remove a GPS by UUID
     bool remove_gps(uuid in_uuid);
@@ -146,20 +188,26 @@ public:
     static int kis_gpspack_hook(CHAINCALL_PARMS);
 
 protected:
-    GlobalRegistry *globalreg;
-
     kis_recursive_timed_mutex gpsmanager_mutex;
 
-    SharedTrackerElement gps_prototypes;
-    TrackerElementVector gps_prototypes_vec;
+    std::shared_ptr<tracker_element_vector> gps_prototypes_vec;
 
     // GPS instances, as a vector, sorted by priority; we don't mind doing a 
     // linear search because we'll typically have very few GPS devices
-    SharedTrackerElement gps_instances;
-    TrackerElementVector gps_instances_vec;
+    std::shared_ptr<tracker_element_vector> gps_instances_vec;
 
     // Extra field we insert into a location triplet
     int tracked_uuid_addition_id;
+
+    // Logging function
+    void log_snapshot_gps();
+
+    // Do we log to the Kismet log?
+    bool database_logging;
+    // Timer for logging GPS path as a snapshot
+    int log_snapshot_timer;
+
+    int pack_comp_gps, pack_comp_no_gps;
 };
 
 #endif

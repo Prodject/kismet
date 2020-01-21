@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -21,7 +21,6 @@
 
 #include "config.h"
 
-#include <string>
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -32,36 +31,55 @@
 #ifdef HAVE_INTTYPES_H
 #include <inttypes.h>
 #endif
+
+#include <unordered_map>
+#include <string>
+
 #include "util.h"
 #include "globalregistry.h"
 
-class Manuf {
+#include "trackedelement.h"
+
+class kis_manuf {
 public:
-	Manuf() { fprintf(stderr, "FATAL OOPS: Manuf()\n"); exit(1); }
-	Manuf(GlobalRegistry *in_globalreg);
+    kis_manuf();
 
-	void IndexOUI();
+    void IndexOUI();
 
-	std::string LookupOUI(mac_addr in_mac);
+    std::shared_ptr<tracker_element_string> lookup_oui(mac_addr in_mac);
+    std::shared_ptr<tracker_element_string> lookup_oui(uint32_t in_oui);
 
-	struct index_pos {
-		uint32_t oui;
-		fpos_t pos;
-	};
+    std::shared_ptr<tracker_element_string> make_manuf(const std::string& in_manuf);
 
-	struct manuf_data {
-		uint32_t oui;
-		std::string manuf;
-	}; 
+    std::shared_ptr<tracker_element_string> get_random_manuf() const {
+        return random_manuf;
+    }
+
+    struct index_pos {
+        uint32_t oui;
+        fpos_t pos;
+    };
+
+    struct manuf_data {
+        uint32_t oui;
+        std::shared_ptr<tracker_element_string> manuf;
+    }; 
+
+    bool is_unknown_manuf(std::shared_ptr<tracker_element_string> in_manuf);
 
 protected:
-	GlobalRegistry *globalreg;
+    kis_recursive_timed_mutex mutex;
 
-	std::vector<index_pos> index_vec;
+    std::vector<index_pos> index_vec;
 
-	std::map<uint32_t, manuf_data> oui_map;
+    std::unordered_map<uint32_t, manuf_data> oui_map;
 
-	FILE *mfile;
+    FILE *mfile;
+
+    // IDs for manufacturer objects
+    int manuf_id;
+    std::shared_ptr<tracker_element_string> unknown_manuf;
+    std::shared_ptr<tracker_element_string> random_manuf;
 };
 
 #endif

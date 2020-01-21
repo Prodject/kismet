@@ -23,7 +23,7 @@
 
 #include "util.h"
 
-void StdoutMessageClient::ProcessMessage(std::string in_msg, int in_flags) {
+void stdout_message_client::process_message(std::string in_msg, int in_flags) {
     if (in_flags & (MSGFLAG_ERROR | MSGFLAG_FATAL))
         fprintf(stderr, "ERROR: %s\n", in_msg.c_str());
     else
@@ -32,30 +32,82 @@ void StdoutMessageClient::ProcessMessage(std::string in_msg, int in_flags) {
     return;
 }
 
-MessageBus::MessageBus(GlobalRegistry *in_globalreg) {
+message_bus::message_bus(global_registry *in_globalreg) {
     globalreg = in_globalreg;
+
+    shutdown = false;
+
+    msg_cl.lock();
+
+    msg_dispatch_t =
+        std::thread([this]() {
+                thread_set_process_name("msgbus");
+                msg_queue_dispatcher();
+            });
 }
 
-MessageBus::~MessageBus() {
-    local_eol_locker lock(&msg_mutex);
+message_bus::~message_bus() {
+    shutdown = true;
+    msg_cl.unlock(0);
+    msg_dispatch_t.join();
 
     globalreg->RemoveGlobal("MESSAGEBUS");
     globalreg->messagebus = NULL;
 }
 
-void MessageBus::InjectMessage(std::string in_msg, int in_flags) {
+void message_bus::inject_message(std::string in_msg, int in_flags) {
     local_locker lock(&msg_mutex);
 
-    for (unsigned int x = 0; x < subscribers.size(); x++) {
-        if (subscribers[x]->mask & in_flags)
-            subscribers[x]->client->ProcessMessage(in_msg, in_flags);
-    }
+    auto msg = std::make_shared<message_bus::message>(in_msg, in_flags);
+
+    msg_queue.push(msg);
+    msg_cl.unlock(1);
 
     return;
 }
 
-void MessageBus::RegisterClient(MessageClient *in_subscriber, int in_mask) {
-    local_locker lock(&msg_mutex);
+void message_bus::msg_queue_dispatcher() {
+    local_demand_locker l(&msg_mutex);
+
+    while (!shutdown && 
+            !Globalreg::globalreg->spindown && 
+            !Globalreg::globalreg->fatal_condition &&
+            !Globalreg::globalreg->complete) {
+        // Lock while we examine the queue
+        l.lock();
+
+        if (msg_queue.size() > 0) {
+            auto e = msg_queue.front();
+            msg_queue.pop();
+
+            // Lock handlers and unlock message queue
+            {
+                l.unlock();
+                local_shared_locker hl(&handler_mutex);
+
+                for (auto sub : subscribers) {
+                    if (sub->mask & e->flags) 
+                        sub->client->process_message(e->msg, e->flags);
+                }
+            }
+
+            // Loop for more events
+            continue;
+        }
+
+        // Reset the lock
+        msg_cl.lock();
+      
+        // Unlock our hold on the system
+        l.unlock();
+
+        // Wait until new events
+        msg_cl.block_until();
+    }
+}
+
+void message_bus::register_client(message_client *in_subscriber, int in_mask) {
+    local_locker lock(&handler_mutex);
 
     busclient *bc = new busclient;
 
@@ -67,8 +119,8 @@ void MessageBus::RegisterClient(MessageClient *in_subscriber, int in_mask) {
     return;
 }
 
-void MessageBus::RemoveClient(MessageClient *in_unsubscriber) {
-    local_locker lock(&msg_mutex);
+void message_bus::remove_client(message_client *in_unsubscriber) {
+    local_locker lock(&handler_mutex);
 
     for (unsigned int x = 0; x < subscribers.size(); x++) {
         if (subscribers[x]->client == in_unsubscriber) {

@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -51,40 +51,40 @@
  *
  */
 
-class KisDatabase {
+class kis_database {
     // Subclasses must implement a public builder, typically one which returns a
     // shared pointer instance if the database is a standalone instance; if it is
     // integrated into a poly class it can be built directly via that classes state
     // system
 protected:
     // Initialize a database w/ a known module name; opening the database is done with
-    // Database_Open(...)
-    KisDatabase(GlobalRegistry *in_globalreg, std::string in_module_name);
+    // database_open(...)
+    kis_database(global_registry *in_globalreg, std::string in_module_name);
 
 public:
-    virtual ~KisDatabase();
+    virtual ~kis_database();
 
     // Open the database file and initialize the KISMET table; if in_path is empty,
     // the database is opened in the local-user settings dir and named according to
     // the module name
-    virtual bool Database_Open(std::string in_path);
-    virtual void Database_Close();
+    virtual bool database_open(std::string in_path);
+    virtual void database_close();
 
-    virtual bool Database_Valid();
+    virtual bool database_valid();
 
-    virtual unsigned int Database_GetDBVersion();
+    virtual unsigned int database_get_db_version();
 
     // Upgrade a database which doesn't match our version
-    virtual int Database_UpgradeDB() = 0;
+    virtual int database_upgrade_db() = 0;
 
 protected:
-    virtual bool Database_CreateMasterTable();
+    virtual bool database_create_master_table();
 
     // Force-set db version, to be called after upgrading the db or
     // creating a new db
-    virtual bool Database_SetDBVersion(unsigned int in_version);
+    virtual bool database_set_db_version(unsigned int in_version);
 
-    GlobalRegistry *globalreg;
+    global_registry *globalreg;
 
     // Module name and target version, filled in by subclasses during initialization
     std::string ds_module_name;
@@ -96,6 +96,75 @@ protected:
     sqlite3 *db;
 };
 
+/* Dynamic database query binder */
+class kis_database_binder {
+public:
+    kis_database_binder() { }
+
+    template<typename T>
+    void bind_field(const std::string& in_query, const T& in_value,
+            std::function<int (sqlite3_stmt *, int, T)> in_binder) {
+        auto b = std::make_shared<binding<T>>(in_query, in_value, in_binder);
+        bindings.push_back(b);
+    }
+
+    sqlite3_stmt *make_query(sqlite3 *db, std::string base); 
+
+    template<typename T>
+    static int bind_numeric(sqlite3_stmt *stmt, int index, const double& value, 
+            std::function<int (sqlite3_stmt *, int, T)> binder) {
+        return binder(stmt, index, value);
+    }
+
+    static int bind_string(sqlite3_stmt *stmt, int index, std::string value) {
+        return sqlite3_bind_text(stmt, index, value.data(), value.length(), 0);
+    }
+
+    static int bind_blob(sqlite3_stmt *stmt, int index, std::string value) {
+        return sqlite3_bind_blob(stmt, index, value.data(), value.length(), 0);
+    }
+
+protected:
+    class binding_interface {
+    public:
+        virtual ~binding_interface() { }
+
+        virtual std::string get_query() = 0;
+        virtual int bind_query(sqlite3_stmt *, int) = 0;
+    };
+
+    template<typename T>
+    class binding : public binding_interface {
+    public:
+        binding(const std::string& in_query, const T& in_value,
+                std::function<int (sqlite3_stmt *, int, T)> in_binder) :
+            query {in_query},
+            value {in_value},
+            binder {in_binder} { }
+        virtual ~binding() { }
+
+        virtual std::string get_query() override {
+            return query;
+        }
+
+        virtual int bind_query(sqlite3_stmt *stmt, int pos) override {
+            if (binder == nullptr)
+                throw std::runtime_error("no sqlite binding function provided");
+
+            if (stmt == nullptr)
+                throw std::runtime_error("null sqlite prepared statement provided");
+
+            return binder(stmt, pos, value);
+        }
+        
+        std::string query;
+        const T value;
+        std::function<int (sqlite3_stmt *, int, T)> binder;
+    };
+
+    std::vector<std::shared_ptr<binding_interface>> bindings;
+
+};
 
 #endif
 

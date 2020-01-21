@@ -25,62 +25,58 @@
 
 #include "kis_datasource.h"
 
-class KisDatasourceLinuxBluetooth;
-typedef std::shared_ptr<KisDatasourceLinuxBluetooth> SharedDatasourceLinuxBluetooth;
+class kis_datasource_linux_bluetooth;
+typedef std::shared_ptr<kis_datasource_linux_bluetooth> shared_datasource_linux_bluetooth;
 
-class KisDatasourceLinuxBluetooth : public KisDatasource {
+class kis_datasource_linux_bluetooth : public kis_datasource {
 public:
-    KisDatasourceLinuxBluetooth(GlobalRegistry *in_globalreg, 
-            SharedDatasourceBuilder in_builder);
+    kis_datasource_linux_bluetooth(shared_datasource_builder in_builder,
+            std::shared_ptr<kis_recursive_timed_mutex> mutex);
 
-    virtual ~KisDatasourceLinuxBluetooth() { };
+    virtual ~kis_datasource_linux_bluetooth() { };
 
 protected:
-    virtual void proto_dispatch_packet(std::string in_type, KVmap in_kvmap);
-   
-    void proto_packet_linuxbtdevice(KVmap in_kvpairs);
+    virtual bool dispatch_rx_packet(std::shared_ptr<KismetExternal::Command> c) override;
+  
+    virtual void handle_packet_linuxbtdevice(uint32_t in_seqno, std::string in_content);
 
-    kis_packet *handle_kv_btdevice(KisDatasourceCapKeyedObject *in_obj);
-
-    int pack_comp_btdevice;
+    int pack_comp_btdevice, pack_comp_meta;
 };
 
 
-class DatasourceLinuxBluetoothBuilder : public KisDatasourceBuilder {
+class datasource_linux_bluetooth_builder : public kis_datasource_builder {
 public:
-    DatasourceLinuxBluetoothBuilder(GlobalRegistry *in_globalreg, int in_id) :
-        KisDatasourceBuilder(in_globalreg, in_id) {
+    datasource_linux_bluetooth_builder() :
+        kis_datasource_builder() {
+        register_fields();
+        reserve_fields(NULL);
+        initialize();
+    }
+
+    datasource_linux_bluetooth_builder(int in_id) :
+        kis_datasource_builder(in_id) {
 
         register_fields();
         reserve_fields(NULL);
         initialize();
     }
 
-    DatasourceLinuxBluetoothBuilder(GlobalRegistry *in_globalreg, int in_id,
-        SharedTrackerElement e) :
-        KisDatasourceBuilder(in_globalreg, in_id, e) {
+    datasource_linux_bluetooth_builder(int in_id, std::shared_ptr<tracker_element_map> e) :
+        kis_datasource_builder(in_id, e) {
 
         register_fields();
         reserve_fields(NULL);
         initialize();
     }
 
-    DatasourceLinuxBluetoothBuilder(GlobalRegistry *in_globalreg) :
-        KisDatasourceBuilder(in_globalreg, 0) {
+    virtual ~datasource_linux_bluetooth_builder() override { }
 
-        register_fields();
-        reserve_fields(NULL);
-        initialize();
+    virtual shared_datasource build_datasource(shared_datasource_builder in_sh_this,
+            std::shared_ptr<kis_recursive_timed_mutex> mutex) override {
+        return std::make_shared<kis_datasource_linux_bluetooth>(in_sh_this, mutex);
     }
 
-    virtual ~DatasourceLinuxBluetoothBuilder() { }
-
-    virtual SharedDatasource build_datasource(SharedDatasourceBuilder in_sh_this) {
-        return SharedDatasourceLinuxBluetooth(new KisDatasourceLinuxBluetooth(globalreg, 
-                    in_sh_this));
-    }
-
-    virtual void initialize() {
+    virtual void initialize() override {
         // Set up our basic parameters for the linux wifi driver
         
         set_source_type("linuxbluetooth");
@@ -112,6 +108,8 @@ public:
 
         // Can't tune a BT
         set_tune_capable(false);
+
+        set_hop_capable(false);
     }
 
 };

@@ -26,82 +26,65 @@
 #include "configfile.h"
 #include "alertracker.h"
 #include "structured.h"
-#include "msgpack_adapter.h"
 #include "kismet_json.h"
 #include "base64.h"
 
-LogTracker::LogTracker(GlobalRegistry *in_globalreg) :
-    tracker_component(in_globalreg, 0),
-    Kis_Net_Httpd_CPPStream_Handler(in_globalreg),
-    globalreg(in_globalreg) {
+log_tracker::log_tracker() :
+    tracker_component(),
+    kis_net_httpd_cppstream_handler() {
 
     streamtracker =
-        Globalreg::FetchMandatoryGlobalAs<StreamTracker>(globalreg, "STREAMTRACKER");
-
-    entrytracker =
-        Globalreg::FetchMandatoryGlobalAs<EntryTracker>(globalreg, "ENTRY_TRACKER");
+        Globalreg::fetch_mandatory_global_as<stream_tracker>("STREAMTRACKER");
 
     register_fields();
     reserve_fields(NULL);
-
+    
+    bind_httpd_server();
 }
 
-LogTracker::~LogTracker() {
-    local_eol_locker lock(&tracker_mutex);
+log_tracker::~log_tracker() {
+    local_locker lock(&tracker_mutex);
 
-    globalreg->RemoveGlobal("LOGTRACKER");
+    Globalreg::globalreg->RemoveGlobal("LOGTRACKER");
 
-    TrackerElementVector v(logfile_vec);
-
-    for (auto i : v) {
-        SharedLogfile f = std::static_pointer_cast<KisLogfile>(i);
-        f->Log_Close();
+    for (auto i : *logfile_vec) {
+        shared_logfile f = std::static_pointer_cast<kis_logfile>(i);
+        f->close_log();
     }
 
     logproto_vec.reset();
     logfile_vec.reset();
 }
 
-void LogTracker::register_fields() { 
-    RegisterField("kismet.logtracker.drivers", TrackerVector,
-            "supported log types", &logproto_vec);
-    RegisterField("kismet.logtracker.logfiles", TrackerVector,
-            "active log files", &logfile_vec);
+void log_tracker::register_fields() { 
+    register_field("kismet.logtracker.drivers", "supported log types", &logproto_vec);
+    register_field("kismet.logtracker.logfiles", "active log files", &logfile_vec);
 
     logproto_entry_id =
-        entrytracker->RegisterField("kismet.logtracker.driver",
-                SharedLogBuilder(new KisLogfileBuilder(globalreg, 0)),
+        Globalreg::globalreg->entrytracker->register_field("kismet.logtracker.driver",
+                tracker_element_factory<kis_logfile_builder>(),
                 "Log driver");
 
     logfile_entry_id =
-        entrytracker->RegisterField("kismet.logtracker.log",
-                SharedLogfile(new KisLogfile(globalreg, 0)),
+        Globalreg::globalreg->entrytracker->register_field("kismet.logtracker.log",
+                tracker_element_factory<kis_logfile>(),
                 "Log file");
 
-    // Normally we'd have to register entity IDs here but we'll never snapshot
-    // the log state so we don't care
-    
-    RegisterField("kismet.logtracker.logging_enabled", TrackerUInt8,
-            "logging enabled", &logging_enabled);
-    RegisterField("kismet.logtracker.title", TrackerString,
-            "session title", &log_title);
-    RegisterField("kismet.logtracker.prefix", TrackerString,
-            "log prefix path", &log_prefix);
-    RegisterField("kismet.logtracker.template", TrackerString,
-            "log name template", &log_template);
-
-    RegisterField("kismet.logtracker.log_types", TrackerVector,
-            "enabled log types", &log_types_vec);
+    register_field("kismet.logtracker.logging_enabled", "logging enabled", &logging_enabled);
+    register_field("kismet.logtracker.title", "session title", &log_title);
+    register_field("kismet.logtracker.prefix", "log prefix path", &log_prefix);
+    register_field("kismet.logtracker.template", "log name template", &log_template);
+    register_field("kismet.logtracker.log_types", "enabled log types", &log_types_vec);
 }
 
-void LogTracker::reserve_fields(SharedTrackerElement e) {
+void log_tracker::reserve_fields(std::shared_ptr<tracker_element_map> e) {
     tracker_component::reserve_fields(e);
 
     // Normally we'd need to implement vector repair for the complex nested
     // types in logproto and logfile, but we don't snapshot state so we don't.
 }
 
-void LogTracker::Deferred_Startup() {
+void log_tracker::trigger_deferred_startup() {
 	int option_idx = 0;
 	std::string retfname;
 
@@ -121,7 +104,7 @@ void LogTracker::Deferred_Startup() {
 	optind = 0;
 
     while (1) {
-        int r = getopt_long(globalreg->argc, globalreg->argv,
+        int r = getopt_long(Globalreg::globalreg->argc, Globalreg::globalreg->argv,
                 "-T:t:np:", 
                 logfile_long_options, &option_idx);
         if (r < 0) break;
@@ -141,10 +124,10 @@ void LogTracker::Deferred_Startup() {
         }
     }
 
-    if (!globalreg->kismet_config->FetchOptBoolean("log_config_present", false)) {
-        std::shared_ptr<Alertracker> alertracker =
-            Globalreg::FetchMandatoryGlobalAs<Alertracker>(globalreg, "ALERTTRACKER");
-        alertracker->RaiseOneShot("CONFIGERROR", "It looks like Kismet is missing "
+    if (!Globalreg::globalreg->kismet_config->fetch_opt_bool("log_config_present", false)) {
+        std::shared_ptr<alert_tracker> alertracker =
+            Globalreg::fetch_mandatory_global_as<alert_tracker>("ALERTTRACKER");
+        alertracker->raise_one_shot("CONFIGERROR", "It looks like Kismet is missing "
                 "the kismet_logging.conf config file.  This file was added recently "
                 "in development.  Without it, logging will not perform as expected.  "
                 "You should either install with 'make forceconfigs' from the Kismet "
@@ -152,44 +135,44 @@ void LogTracker::Deferred_Startup() {
     }
 
     if (arg_enable < 0)
-        set_int_logging_enabled(globalreg->kismet_config->FetchOptBoolean("enable_logging", true));
+        set_int_logging_enabled(Globalreg::globalreg->kismet_config->fetch_opt_bool("enable_logging", true));
     else
         set_int_logging_enabled(false);
 
     if (argtitle.length() == 0)
-        set_int_log_title(globalreg->kismet_config->FetchOptDfl("log_title", "Kismet"));
+        set_int_log_title(Globalreg::globalreg->kismet_config->fetch_opt_dfl("log_title", "Kismet"));
     else
         set_int_log_title(argtitle);
 
     if (argprefix.length() == 0) 
-        set_int_log_prefix(globalreg->kismet_config->FetchOptDfl("log_prefix", "./"));
+        set_int_log_prefix(Globalreg::globalreg->kismet_config->fetch_opt_dfl("log_prefix", "./"));
     else
         set_int_log_prefix(argprefix);
 
-    set_int_log_template(globalreg->kismet_config->FetchOptDfl("log_template", 
+    Globalreg::globalreg->log_prefix = get_log_prefix();
+
+    set_int_log_template(Globalreg::globalreg->kismet_config->fetch_opt_dfl("log_template", 
                 "%p/%n-%D-%t-%i.%l"));
 
 
     std::vector<std::string> types;
    
     if (argtypes.length() == 0)
-        types = StrTokenize(globalreg->kismet_config->FetchOpt("log_types"), ",");
+        types = str_tokenize(Globalreg::globalreg->kismet_config->fetch_opt("log_types"), ",");
     else
-        types = StrTokenize(argtypes, ",");
+        types = str_tokenize(argtypes, ",");
         
 
-    TrackerElementVector v(log_types_vec);
-
     for (auto t : types) {
-        SharedTrackerElement e(new TrackerElement(TrackerString, 0));
-        e->set((std::string) t);
-        v.push_back(e);
+        auto e = std::make_shared<tracker_element_string>();
+        e->set(t);
+        log_types_vec->push_back(e);
     }
 
     if (!get_logging_enabled()) {
-        std::shared_ptr<Alertracker> alertracker =
-            Globalreg::FetchMandatoryGlobalAs<Alertracker>(globalreg, "ALERTTRACKER");
-        alertracker->RaiseOneShot("LOGDISABLED", "Logging has been disabled via the Kismet "
+        std::shared_ptr<alert_tracker> alertracker =
+            Globalreg::fetch_mandatory_global_as<alert_tracker>("ALERTTRACKER");
+        alertracker->raise_one_shot("LOGDISABLED", "Logging has been disabled via the Kismet "
                 "config files or the command line.  Pcap, database, and related logs "
                 "will not be saved.", -1);
         _MSG("Logging disabled, not enabling any log drivers.", MSGFLAG_INFO);
@@ -197,35 +180,31 @@ void LogTracker::Deferred_Startup() {
     }
 
     // Open all of them
-    for (auto t : v) {
-        std::string logtype = GetTrackerValue<std::string>(t);
+    for (auto t : *log_types_vec) {
+        auto logtype = get_tracker_value<std::string>(t);
         open_log(logtype);
     }
 
     return;
 }
 
-void LogTracker::Deferred_Shutdown() {
-    TrackerElementVector logfiles(logfile_vec);
+void log_tracker::trigger_deferred_shutdown() {
+    for (auto l : *logfile_vec) {
+        shared_logfile lf = std::static_pointer_cast<kis_logfile>(l);
 
-    for (auto l : logfiles) {
-        SharedLogfile lf = std::static_pointer_cast<KisLogfile>(l);
-
-        lf->Log_Close();
+        lf->close_log();
     }
 
     return;
 }
 
-int LogTracker::register_log(SharedLogBuilder in_builder) {
+int log_tracker::register_log(shared_log_builder in_builder) {
     local_locker lock(&tracker_mutex);
 
-    TrackerElementVector vec(logproto_vec);
+    for (auto i : *logproto_vec) {
+        auto b = std::static_pointer_cast<kis_logfile_builder>(i);
 
-    for (auto i : vec) {
-        SharedLogBuilder b = std::static_pointer_cast<KisLogfileBuilder>(i);
-
-        if (StrLower(b->get_log_class()) == StrLower(in_builder->get_log_class())) {
+        if (str_lower(b->get_log_class()) == str_lower(in_builder->get_log_class())) {
             _MSG("A logfile driver has already been registered for '" + 
                     in_builder->get_log_class() + "', cannot register it twice.",
                     MSGFLAG_ERROR);
@@ -233,24 +212,22 @@ int LogTracker::register_log(SharedLogBuilder in_builder) {
         }
     }
 
-    vec.push_back(in_builder);
+    logproto_vec->push_back(in_builder);
 
     return 1;
 }
 
-SharedLogfile LogTracker::open_log(std::string in_class) {
+shared_logfile log_tracker::open_log(std::string in_class) {
     return open_log(in_class, get_log_title());
 }
 
-SharedLogfile LogTracker::open_log(std::string in_class, std::string in_title) {
+shared_logfile log_tracker::open_log(std::string in_class, std::string in_title) {
     local_locker lock(&tracker_mutex);
 
-    SharedLogBuilder target_builder;
+    shared_log_builder target_builder;
 
-    TrackerElementVector builders(logproto_vec);
-
-    for (auto b : builders) {
-        std::shared_ptr<KisLogfileBuilder> builder = std::static_pointer_cast<KisLogfileBuilder>(b);
+    for (auto b : *logproto_vec) {
+        auto builder = std::static_pointer_cast<kis_logfile_builder>(b);
 
         if (builder->get_log_class() == in_class) {
             return open_log(builder, in_title);
@@ -260,22 +237,20 @@ SharedLogfile LogTracker::open_log(std::string in_class, std::string in_title) {
     return 0;
 }
 
-SharedLogfile LogTracker::open_log(SharedLogBuilder in_builder) {
+shared_logfile log_tracker::open_log(shared_log_builder in_builder) {
     return open_log(in_builder, get_log_title());
 }
 
-SharedLogfile LogTracker::open_log(SharedLogBuilder in_builder, std::string in_title) {
+shared_logfile log_tracker::open_log(shared_log_builder in_builder, std::string in_title) {
     local_locker lock(&tracker_mutex);
 
     if (in_builder == NULL)
         return NULL;
 
-    TrackerElementVector logfiles(logfile_vec);
-
     // If it's a singleton, make sure we're the only one
     if (in_builder->get_singleton()) {
-        for (auto l : logfiles) {
-            SharedLogfile lf = std::static_pointer_cast<KisLogfile>(l);
+        for (auto l : *logfile_vec) {
+            auto lf = std::static_pointer_cast<kis_logfile>(l);
 
             if (lf->get_builder()->get_log_class() == in_builder->get_log_class() &&
                     lf->get_log_open()) {
@@ -286,15 +261,15 @@ SharedLogfile LogTracker::open_log(SharedLogBuilder in_builder, std::string in_t
         }
     }
 
-    SharedLogfile lf = in_builder->build_logfile(in_builder);
+    shared_logfile lf = in_builder->build_logfile(in_builder);
     lf->set_id(logfile_entry_id);
-    logfiles.push_back(lf);
+    logfile_vec->push_back(lf);
 
     std::string logpath =
-        globalreg->kismet_config->ExpandLogPath(get_log_template(),
+        Globalreg::globalreg->kismet_config->expand_log_path(get_log_template(),
                 in_title, lf->get_builder()->get_log_class(), 1, 0);
 
-    if (!lf->Log_Open(logpath)) {
+    if (!lf->open_log(logpath)) {
         _MSG("Failed to open " + lf->get_builder()->get_log_class() + " log " + logpath,
                 MSGFLAG_ERROR);
     }
@@ -302,15 +277,15 @@ SharedLogfile LogTracker::open_log(SharedLogBuilder in_builder, std::string in_t
     return lf;
 }
 
-int LogTracker::close_log(SharedLogfile in_logfile) {
+int log_tracker::close_log(shared_logfile in_logfile) {
     local_locker lock(&tracker_mutex);
 
-    in_logfile->Log_Close();
+    in_logfile->close_log();
 
     return 1;
 }
 
-void LogTracker::Usage(const char *argv0) {
+void log_tracker::usage(const char *argv0) {
     printf(" *** Logging Options ***\n");
 	printf(" -T, --log-types <types>      Override activated log types\n"
 		   " -t, --log-title <title>      Override default log title\n"
@@ -318,12 +293,12 @@ void LogTracker::Usage(const char *argv0) {
 		   " -n, --no-logging             Disable logging entirely\n");
 }
 
-bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
+bool log_tracker::httpd_verify_path(const char *path, const char *method) {
     if (strcmp(method, "GET") == 0) {
-        if (!Httpd_CanSerialize(path))
+        if (!httpd_can_serialize(path))
             return false;
 
-        std::string stripped = Httpd_StripSuffix(path);
+        std::string stripped = httpd_strip_suffix(path);
 
         if (stripped == "/logging/drivers")
             return true;
@@ -331,7 +306,7 @@ bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
         if (stripped == "/logging/active")
             return true;
 
-        std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+        std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
         // /logging/by-uuid/[foo]/stop 
 
@@ -351,10 +326,8 @@ bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
 
             local_locker lock(&tracker_mutex);
 
-            TrackerElementVector fvec(logfile_vec);
-
-            for (auto lfi : fvec) {
-                std::shared_ptr<KisLogfile> lf = std::static_pointer_cast<KisLogfile>(lfi);
+            for (auto lfi : *logfile_vec) {
+                auto lf = std::static_pointer_cast<kis_logfile>(lfi);
 
                 if (lf->get_log_uuid() == u)
                     return true;
@@ -365,11 +338,8 @@ bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
 
             local_locker lock(&tracker_mutex);
 
-            TrackerElementVector lfvec(logproto_vec);
-
-            for (auto lfi : lfvec) {
-                std::shared_ptr<KisLogfileBuilder> lfb =
-                    std::static_pointer_cast<KisLogfileBuilder>(lfi);
+            for (auto lfi : *logproto_vec) {
+                auto lfb = std::static_pointer_cast<kis_logfile_builder>(lfi);
 
                 if (lfb->get_log_class() == tokenurl[3])
                     return true;
@@ -377,12 +347,12 @@ bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
         }
 
     } else if (strcmp(method, "POST") == 0) {
-        if (!Httpd_CanSerialize(path))
+        if (!httpd_can_serialize(path))
             return false;
 
-        std::string stripped = Httpd_StripSuffix(path);
+        std::string stripped = httpd_strip_suffix(path);
 
-        std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+        std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
         // /logging/by-class/[foo]/start + post vars
 
@@ -398,11 +368,8 @@ bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
 
             local_locker lock(&tracker_mutex);
 
-            TrackerElementVector lfvec(logproto_vec);
-
-            for (auto lfi : lfvec) {
-                std::shared_ptr<KisLogfileBuilder> lfb =
-                    std::static_pointer_cast<KisLogfileBuilder>(lfi);
+            for (auto lfi : *logproto_vec) {
+                auto lfb = std::static_pointer_cast<kis_logfile_builder>(lfi);
 
                 if (lfb->get_log_class() == tokenurl[3])
                     return true;
@@ -413,24 +380,26 @@ bool LogTracker::Httpd_VerifyPath(const char *path, const char *method) {
     return false;
 }
 
-void LogTracker::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
+void log_tracker::httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
             const char *url, const char *method, const char *upload_data,
             size_t *upload_data_size, std::stringstream &stream) {
 
     local_locker lock(&tracker_mutex);
 
-    std::string stripped = Httpd_StripSuffix(url);
+    std::string stripped = httpd_strip_suffix(url);
 
     if (stripped == "/logging/drivers") {
-        entrytracker->Serialize(httpd->GetSuffix(url), stream, logproto_vec, NULL);
+        Globalreg::globalreg->entrytracker->serialize(httpd->get_suffix(url), stream, 
+                logproto_vec, NULL);
         return;
     } else if (stripped == "/logging/active") {
-        entrytracker->Serialize(httpd->GetSuffix(url), stream, logfile_vec, NULL);
+        Globalreg::globalreg->entrytracker->serialize(httpd->get_suffix(url), stream, 
+                logfile_vec, NULL);
         return;
     }
 
-    std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+    std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
     // /logging/by-uuid/[foo]/stop + post vars
 
@@ -447,19 +416,17 @@ void LogTracker::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
                 throw std::runtime_error("invalid uuid");
             }
 
-            if (!httpd->HasValidSession(connection)) {
+            if (!httpd->has_valid_session(connection)) {
                 connection->httpcode = 503;
                 return;
             }
 
             local_locker lock(&tracker_mutex);
 
-            TrackerElementVector fvec(logfile_vec);
+            std::shared_ptr<kis_logfile> logfile;
 
-            std::shared_ptr<KisLogfile> logfile;
-
-            for (auto lfi : fvec) {
-                std::shared_ptr<KisLogfile> lf = std::static_pointer_cast<KisLogfile>(lfi);
+            for (auto lfi : *logfile_vec) {
+                auto lf = std::static_pointer_cast<kis_logfile>(lfi);
 
                 if (lf->get_log_uuid() == u) {
                     logfile = lf;
@@ -471,23 +438,20 @@ void LogTracker::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
                 throw std::runtime_error("invalid log uuid");
             }
 
-            _MSG("Closing log file " + logfile->get_log_uuid().UUID2String() + " (" + 
+            _MSG("Closing log file " + logfile->get_log_uuid().uuid_to_string() + " (" + 
                     logfile->get_log_path() + ")", MSGFLAG_INFO);
 
-            logfile->Log_Close();
+            logfile->close_log();
 
             stream << "OK";
             return;
         } else if (tokenurl[2] == "by-class") {
             local_locker lock(&tracker_mutex);
 
-            TrackerElementVector lfvec(logproto_vec);
+            std::shared_ptr<kis_logfile_builder> builder;
 
-            std::shared_ptr<KisLogfileBuilder> builder;
-
-            for (auto lfi : lfvec) {
-                std::shared_ptr<KisLogfileBuilder> lfb =
-                    std::static_pointer_cast<KisLogfileBuilder>(lfi);
+            for (auto lfi : *logproto_vec) {
+                auto lfb = std::static_pointer_cast<kis_logfile_builder>(lfi);
 
                 if (lfb->get_log_class() == tokenurl[3]) {
                     builder = lfb;
@@ -499,21 +463,22 @@ void LogTracker::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
                 throw std::runtime_error("invalid logclass");
 
             if (tokenurl[4] == "start") {
-                SharedLogfile logf;
+                shared_logfile logf;
 
                 logf = open_log(builder);
 
                 if (logf == NULL) 
                     throw std::runtime_error("unable to open log");
 
-                entrytracker->Serialize(httpd->GetSuffix(url), stream, logf, NULL);
+                Globalreg::globalreg->entrytracker->serialize(httpd->get_suffix(url), stream, 
+                        logf, NULL);
 
                 return;
             }
         } else {
             throw std::runtime_error("unknown url");
         }
-    } catch(const std::exception e) {
+    } catch(const std::exception& e) {
         stream << "Invalid request: ";
         stream << e.what();
         connection->httpcode = 400;
@@ -522,34 +487,32 @@ void LogTracker::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
 
 }
 
-int LogTracker::Httpd_PostComplete(Kis_Net_Httpd_Connection *concls) {
-    SharedStructured structdata;
+int log_tracker::httpd_post_complete(kis_net_httpd_connection *concls) {
+    shared_structured structdata;
 
     // All the posts require login
-    if (!httpd->HasValidSession(concls, true)) {
+    if (!httpd->has_valid_session(concls, true)) {
         return MHD_YES;
     }
 
     try {
-        // Decode the base64 msgpack and parse it, or parse the json
-        if (concls->variable_cache.find("msgpack") != concls->variable_cache.end()) {
-            structdata.reset(new StructuredMsgpack(Base64::decode(concls->variable_cache["msgpack"]->str())));
-        } else if (concls->variable_cache.find("json") != 
+        // Parse the json
+        if (concls->variable_cache.find("json") != 
                 concls->variable_cache.end()) {
-            structdata.reset(new StructuredJson(concls->variable_cache["json"]->str()));
+            structdata.reset(new structured_json(concls->variable_cache["json"]->str()));
         } else {
-            throw StructuredDataException("Missing data");
+            throw structured_data_exception("Missing data");
         }
-    } catch(const StructuredDataException e) {
+    } catch(const structured_data_exception& e) {
         concls->response_stream << "Invalid request: ";
         concls->response_stream << e.what();
         concls->httpcode = 400;
         return MHD_YES;
     }
 
-    std::string stripped = Httpd_StripSuffix(concls->url);
+    std::string stripped = httpd_strip_suffix(concls->url);
 
-    std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+    std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
     // /logging/by-class/[foo]/start + post vars
 
@@ -563,13 +526,10 @@ int LogTracker::Httpd_PostComplete(Kis_Net_Httpd_Connection *concls) {
         if (tokenurl[2] == "by-class") {
             local_locker lock(&tracker_mutex);
 
-            TrackerElementVector lfvec(logproto_vec);
+            std::shared_ptr<kis_logfile_builder> builder;
 
-            std::shared_ptr<KisLogfileBuilder> builder;
-
-            for (auto lfi : lfvec) {
-                std::shared_ptr<KisLogfileBuilder> lfb =
-                    std::static_pointer_cast<KisLogfileBuilder>(lfi);
+            for (auto lfi : *logproto_vec) {
+                auto lfb = std::static_pointer_cast<kis_logfile_builder>(lfi);
 
                 if (lfb->get_log_class() == tokenurl[3]) {
                     builder = lfb;
@@ -581,24 +541,24 @@ int LogTracker::Httpd_PostComplete(Kis_Net_Httpd_Connection *concls) {
                 throw std::runtime_error("invalid logclass");
 
             if (tokenurl[4] == "start") {
-                std::string title = structdata->getKeyAsString("title", "");
+                std::string title = structdata->key_as_string("title", "");
 
                 if (title == "")
                     title = get_log_title();
 
-                SharedLogfile logf;
+                shared_logfile logf;
 
                 logf = open_log(builder, title);
 
                 if (logf == NULL) 
                     throw std::runtime_error("unable to open log");
 
-                entrytracker->Serialize(httpd->GetSuffix(concls->url),
+                Globalreg::globalreg->entrytracker->serialize(httpd->get_suffix(concls->url),
                         concls->response_stream, logf, NULL);
                 return MHD_YES;
             }
         }
-    } catch(const std::exception e) {
+    } catch(const std::exception& e) {
         concls->response_stream << "Invalid request: ";
         concls->response_stream << e.what();
         concls->httpcode = 400;

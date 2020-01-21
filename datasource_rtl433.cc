@@ -22,75 +22,37 @@
 #include "kismet_json.h"
 #include "phy_rtl433.h"
 
-KisDatasourceRtl433::KisDatasourceRtl433(GlobalRegistry *in_globalreg,
-        SharedDatasourceBuilder in_builder) :
-    KisDatasource(in_globalreg, in_builder),
-    Kis_Net_Httpd_CPPStream_Handler(in_globalreg) {
+kis_datasource_rtl433::kis_datasource_rtl433(shared_datasource_builder in_builder, 
+        std::shared_ptr<kis_recursive_timed_mutex> mutex) :
+    kis_datasource(in_builder, mutex) {
 
-    pack_comp_rtl433 = packetchain->RegisterPacketComponent("RTL433JSON");
-    pack_comp_metablob = packetchain->RegisterPacketComponent("METABLOB");
-    pack_comp_datasrc = packetchain->RegisterPacketComponent("KISDATASRC");
-
-    std::string devnum = MungeToPrintable(get_definition_opt("device"));
+    std::string devnum = munge_to_printable(get_definition_opt("device"));
     if (devnum != "") {
         set_int_source_cap_interface("rtl433usb#" + devnum);
     } else {
         set_int_source_cap_interface("rtl433usb");
     }
 
-    set_int_source_retry(false);
-    set_int_source_passive(true);
-
     set_int_source_hardware("rtlsdr");
-
-    _MSG("Created RTL433 datasource.  This data source receives events from a helper tool, "
-            "kismet_cap_sdr_rtl433; make sure this tool is running.", MSGFLAG_INFO);
+    set_int_source_ipc_binary("kismet_cap_sdr_rtl433");
 }
 
-KisDatasourceRtl433::~KisDatasourceRtl433() {
-
-}
-
-bool KisDatasourceRtl433::Httpd_VerifyPath(const char *path, const char *method) {
-    if (strcmp(method, "POST") == 0) {
-        if (!Httpd_CanSerialize(path))
-            return false;
-
-        std::string stripped = Httpd_StripSuffix(path);
-        std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
-
-        if (tokenurl.size() < 5)
-            return false;
-
-        if (tokenurl[1] != "datasource")
-            return false;
-
-        if (tokenurl[2] != "by-uuid")
-            return false;
-
-        if (tokenurl[3] != get_source_uuid().UUID2String())
-            return false;
-
-        if (tokenurl[4] == "update")
-            return true;
-    }
-
-    return false;
-}
-
-void KisDatasourceRtl433::Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-        Kis_Net_Httpd_Connection *connection,
-        const char *url, const char *method, const char *upload_data,
-        size_t *upload_data_size, std::stringstream &stream) {
+kis_datasource_rtl433::~kis_datasource_rtl433() {
 
 }
 
-int KisDatasourceRtl433::Httpd_PostComplete(Kis_Net_Httpd_Connection *concls) {
-    std::string stripped = Httpd_StripSuffix(concls->url);
-    std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+void kis_datasource_rtl433::open_interface(std::string in_definition, unsigned int in_transaction,
+        open_callback_t in_cb) {
+    kis_datasource::open_interface(in_definition, in_transaction, in_cb);
+}
+
+#if 0
+int kis_datasource_rtl433::httpd_post_complete(kis_net_httpd_connection *concls) {
+    std::string stripped = httpd_strip_suffix(concls->url);
+    std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
     // Anything involving POST here requires a login
-    if (!httpd->HasValidSession(concls, true)) {
+    if (!httpd->has_valid_session(concls, true)) {
         return 1;
     }
 
@@ -103,106 +65,10 @@ int KisDatasourceRtl433::Httpd_PostComplete(Kis_Net_Httpd_Connection *concls) {
     if (tokenurl[2] != "by-uuid")
         return MHD_NO;
 
-    if (tokenurl[3] != get_source_uuid().UUID2String())
+    if (tokenurl[3] != get_source_uuid().uuid_to_string())
         return MHD_NO;
 
     if (tokenurl[4] == "update") {
-        Json::Value device_json;
-        Json::Value gps_json;
-        Json::Value meta_json;
-
-        try {
-            std::stringstream ss;
-            
-            ss.str(concls->variable_cache["device"]->str());
-            ss >> device_json;
-
-            ss.str(concls->variable_cache["meta"]->str());
-            ss >> meta_json;
-
-            if (concls->variable_cache.find("gps") != concls->variable_cache.end()) {
-                ss.str(concls->variable_cache["gps"]->str());
-                ss >> gps_json;
-            }
-        } catch (std::exception& e) {
-            concls->response_stream << "Invalid request:  could not parse JSON: " << e.what();
-            concls->httpcode = 400;
-            return MHD_YES;
-        }
-
-        kis_packet *packet = packetchain->GeneratePacket();
-
-        try {
-            if (clobber_timestamp) {
-                gettimeofday(&(packet->ts), NULL);
-            } else {
-                auto tv_sec_j = meta_json["tv_sec"];
-                auto tv_usec_j = meta_json["tv_usec"];
-
-                packet->ts.tv_sec = tv_sec_j.asUInt64();
-                packet->ts.tv_usec = tv_usec_j.asUInt64();
-            }
-
-            if (gps_json.isObject()) {
-                auto lat_j = gps_json["lat"];
-                auto lon_j = gps_json["lon"];
-                auto alt_j = gps_json["alt"];
-                auto spd_j = gps_json["speed"];
-                auto head_j = gps_json["heading"];
-                auto prec_j = gps_json["precision"];
-                auto time_j = gps_json["time"];
-                auto fix_j = gps_json["fix"];
-
-                if (lat_j.isNumeric() && lon_j.isNumeric()) {
-                    kis_gps_packinfo *gpsinfo = new kis_gps_packinfo();
-
-                    gpsinfo->lat = lat_j.asDouble();
-                    gpsinfo->lon = lon_j.asDouble();
-
-                    gpsinfo->fix = 2;
-
-                    if (alt_j.isNumeric()) {
-                        gpsinfo->alt = alt_j.asDouble();
-                        gpsinfo->fix = 3;
-                    }
-
-                    if (fix_j.isNumeric()) 
-                        gpsinfo->fix = fix_j.asUInt();
-
-                    if (spd_j.isNumeric())
-                        gpsinfo->speed = spd_j.asDouble();
-
-                    if (head_j.isNumeric()) 
-                        gpsinfo->heading = head_j.asDouble();
-
-                    if (prec_j.isNumeric())
-                        gpsinfo->precision = prec_j.asDouble();
-
-                    if (time_j.isNumeric()) {
-                        gpsinfo->tv.tv_sec = time_j.asUInt64();
-                        gpsinfo->tv.tv_usec = 0;
-                    }
-
-                    packet->insert(pack_comp_gps, gpsinfo);
-                }
-            }
-        } catch (std::exception& e) {
-            packetchain->DestroyPacket(packet);
-            packet = NULL;
-
-            concls->response_stream << "Invalid request:  could not process packet: " << e.what();
-            concls->httpcode = 400;
-            return MHD_YES;
-        }
-
-        // Put the parsed JSON in a rtl433
-        packet_info_rtl433 *r433info = new packet_info_rtl433(device_json);
-        packet->insert(pack_comp_rtl433, r433info);
-
-        // Put the raw JSON in a metablob
-        packet_metablob *metablob = new packet_metablob("RTL433", 
-                concls->variable_cache["device"]->str());
-        packet->insert(pack_comp_metablob, metablob);
 
         packetchain_comp_datasource *datasrcinfo = new packetchain_comp_datasource();
         datasrcinfo->ref_source = this;
@@ -211,10 +77,12 @@ int KisDatasourceRtl433::Httpd_PostComplete(Kis_Net_Httpd_Connection *concls) {
         inc_source_num_packets(1);
         get_source_packet_rrd()->add_sample(1, time(0));
 
-        packetchain->ProcessPacket(packet);
+        packetchain->process_packet(packet);
     }
 
     return MHD_NO;
 }
+#endif
+
 
 

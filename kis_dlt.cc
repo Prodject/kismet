@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -26,38 +26,42 @@
 #include "kis_dlt.h"
 
 int kis_dlt_packethook(CHAINCALL_PARMS) {
-	return ((Kis_DLT_Handler *) auxdata)->HandlePacket(in_pack);
+	return ((kis_dlt_handler *) auxdata)->handle_packet(in_pack);
 }
 
-Kis_DLT_Handler::Kis_DLT_Handler(GlobalRegistry *in_globalreg) {
-	globalreg = in_globalreg;
+kis_dlt_handler::kis_dlt_handler() :
+    lifetime_global(), 
+    dlt_name {"UNASSIGNED"},
+    dlt {-1} {
 
-	dlt = -1;
-	dlt_name = "UNASSIGNED";
+    auto packetchain =
+        Globalreg::fetch_mandatory_global_as<packet_chain>();
 
 	chainid = 
-		globalreg->packetchain->RegisterHandler(&kis_dlt_packethook, this,
-												CHAINPOS_POSTCAP, 0);
+		packetchain->register_handler(&kis_dlt_packethook, this,
+                CHAINPOS_POSTCAP, 0);
 
 	pack_comp_linkframe =
-		globalreg->packetchain->RegisterPacketComponent("LINKFRAME");
+		packetchain->register_packet_component("LINKFRAME");
 	pack_comp_decap =
-		globalreg->packetchain->RegisterPacketComponent("DECAP");
+		packetchain->register_packet_component("DECAP");
 	pack_comp_datasrc =
-		globalreg->packetchain->RegisterPacketComponent("KISDATASRC");
+		packetchain->register_packet_component("KISDATASRC");
 	pack_comp_radiodata = 
-		globalreg->packetchain->RegisterPacketComponent("RADIODATA");
+		packetchain->register_packet_component("RADIODATA");
 	pack_comp_gps =
-		globalreg->packetchain->RegisterPacketComponent("GPS");
+		packetchain->register_packet_component("GPS");
 	pack_comp_checksum =
-		globalreg->packetchain->RegisterPacketComponent("CHECKSUM");
+		packetchain->register_packet_component("CHECKSUM");
 
 }
 
-Kis_DLT_Handler::~Kis_DLT_Handler() {
-	if (chainid > 0) {
-		globalreg->packetchain->RemoveHandler(chainid, CHAINPOS_POSTCAP);
-	}
+kis_dlt_handler::~kis_dlt_handler() {
+    auto packetchain = 
+        Globalreg::FetchGlobalAs<packet_chain>();
+
+	if (packetchain != nullptr) 
+		packetchain->remove_handler(chainid, CHAINPOS_POSTCAP);
 
 	chainid = -1;
 }

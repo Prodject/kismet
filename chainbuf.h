@@ -43,11 +43,11 @@
  *
  */
 
-class Chainbuf : public CommonBuffer {
+class chainbuf : public common_buffer {
 public:
     // Size per chunk and number of slots to pre-allocate in the buffer
-    Chainbuf(size_t in_chunk = 1024, size_t pre_allocate = 128);
-    virtual ~Chainbuf();
+    chainbuf(size_t in_chunk = 1024, size_t pre_allocate = 128);
+    virtual ~chainbuf();
 
     // Erase buffer
     virtual void clear();
@@ -99,7 +99,7 @@ protected:
     size_t used_sz;
     size_t total_sz;
 
-    bool free_read, free_commit;
+    std::atomic<bool> free_read, free_commit;
 
     size_t alloc_delta;
 

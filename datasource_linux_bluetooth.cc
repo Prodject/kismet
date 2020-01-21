@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -18,75 +18,118 @@
 
 #include "config.h"
 
-#include "kis_datasource.h"
-#include "simple_datasource_proto.h"
 #include "datasource_linux_bluetooth.h"
+#include "json_adapter.h"
 #include "phy_bluetooth.h"
-#include "msgpack_adapter.h"
+#include "protobuf_cpp/linuxbluetooth.pb.h"
 
 #ifdef HAVE_LINUX_BLUETOOTH_DATASOURCE
 
-KisDatasourceLinuxBluetooth::KisDatasourceLinuxBluetooth(GlobalRegistry *in_globalreg, 
-        SharedDatasourceBuilder in_builder) : KisDatasource(in_globalreg, in_builder) {
+kis_datasource_linux_bluetooth::kis_datasource_linux_bluetooth(shared_datasource_builder in_builder,
+        std::shared_ptr<kis_recursive_timed_mutex> mutex) : 
+    kis_datasource(in_builder, mutex) {
     // Set the capture binary
     set_int_source_ipc_binary("kismet_cap_linux_bluetooth");
 
-    pack_comp_btdevice = packetchain->RegisterPacketComponent("BTDEVICE");
+    pack_comp_btdevice = packetchain->register_packet_component("BTDEVICE");
+    pack_comp_meta = packetchain->register_packet_component("METABLOB");
 }
 
-void KisDatasourceLinuxBluetooth::proto_dispatch_packet(std::string in_type, KVmap in_kvmap) {
-    local_locker lock(&source_lock);
+bool kis_datasource_linux_bluetooth::dispatch_rx_packet(std::shared_ptr<KismetExternal::Command> c) {
+    if (kis_datasource::dispatch_rx_packet(c))
+        return true;
 
-    KisDatasource::proto_dispatch_packet(in_type, in_kvmap);
-
-    std::string ltype = StrLower(in_type);
-
-    if (ltype == "linuxbtdevice") {
-        proto_packet_linuxbtdevice(in_kvmap);
+    if (c->command() == "LBTDATAREPORT") {
+        handle_packet_linuxbtdevice(c->seqno(), c->content());
+        return true;
     }
+
+    return false;
 }
 
-void KisDatasourceLinuxBluetooth::proto_packet_linuxbtdevice(KVmap in_kvpairs) {
-    KVmap::iterator i;
+void kis_datasource_linux_bluetooth::handle_packet_linuxbtdevice(uint32_t in_seqno, 
+        std::string in_content) {
 
-    kis_packet *packet = NULL;
+    // If we're paused, throw away this packet
+    {
+        local_locker lock(ext_mutex);
+
+        if (get_source_paused())
+            return;
+    }
+
+    KismetLinuxBluetooth::LinuxBluetoothDataReport report;
+
+    if (!report.ParseFromString(in_content)) {
+        _MSG(std::string("Kismet datasource driver ") + get_source_builder()->get_source_type() + 
+                std::string(" could not parse the data report, something is wrong with "
+                    "the remote capture tool"), MSGFLAG_ERROR);
+        trigger_error("Invalid LBTDATAREPORT");
+        return;
+    }
+
+    if (report.has_message()) 
+        _MSG(report.message().msgtext(), report.message().msgtype());
+
+    if (report.has_warning())
+        set_int_source_warning(report.warning());
+
+    kis_packet *packet = packetchain->generate_packet();
+    bluetooth_packinfo *bpi = new bluetooth_packinfo();
+
+    packet->insert(pack_comp_btdevice, bpi);
+
     kis_layer1_packinfo *siginfo = NULL;
     kis_gps_packinfo *gpsinfo = NULL;
 
-    if ((i = in_kvpairs.find("message")) != in_kvpairs.end()) {
-        handle_kv_message(i->second);
-    }
-
-    if ((i = in_kvpairs.find("warning")) != in_kvpairs.end()) {
-        handle_kv_warning(i->second);
-    }
-
-    if ((i = in_kvpairs.find("btdevice")) != in_kvpairs.end()) {
-        packet = handle_kv_btdevice(i->second);
-    }
-
-    if (packet == NULL)
-        return;
-
-    // Gather signal data
-    if ((i = in_kvpairs.find("signal")) != in_kvpairs.end()) {
-        siginfo = handle_kv_signal(i->second);
-    }
-
-    // Gather GPS data
-    if ((i = in_kvpairs.find("gps")) != in_kvpairs.end()) {
-        gpsinfo = handle_kv_gps(i->second);
-    }
-
-    // Add them to the packet
-    if (siginfo != NULL) {
+    if (report.has_signal()) {
+        siginfo = handle_sub_signal(report.signal());
         packet->insert(pack_comp_l1info, siginfo);
     }
 
-    if (gpsinfo != NULL) {
+    if (report.has_gps()) {
+        gpsinfo = handle_sub_gps(report.gps());
         packet->insert(pack_comp_gps, gpsinfo);
     }
-    
+
+    if (clobber_timestamp && get_source_remote()) {
+        gettimeofday(&(packet->ts), NULL);
+    } else {
+        packet->ts.tv_sec = report.btdevice().time_sec();
+        packet->ts.tv_usec = report.btdevice().time_usec();
+    }
+
+    bpi->address = mac_addr(report.btdevice().address());
+    bpi->name = munge_to_printable(report.btdevice().name());
+    bpi->txpower = report.btdevice().txpower();
+    bpi->type = report.btdevice().type();
+
+    for (auto u : report.btdevice().uuid_list()) 
+        bpi->service_uuid_vec.push_back(uuid(u));
+
+    // Forge a metablob until we transition the capture protocols
+    std::stringstream fake_json;
+    fake_json << "{";
+    fake_json << "\"bt_address\":\"" << bpi->address << "\",";
+    fake_json << "\"bt_name\":\"" << json_adapter::sanitize_string(bpi->name) << "\",";
+    fake_json << "\"txpower\":" << bpi->txpower << ",";
+    fake_json << "\"type\":" << bpi->type << ",";
+    fake_json << "\"uuid_list\": [";
+
+    bool need_comma = false;
+    for (auto u : bpi->service_uuid_vec) {
+        fake_json << "\"" << u << "\"";
+        if (need_comma) 
+            fake_json << ",";
+        need_comma = true;
+    }
+
+    fake_json << "]";
+    fake_json << "}";
+
+    auto metablob = new packet_metablob("LINUXBLUETOOTH", fake_json.str());
+    packet->insert(pack_comp_meta, metablob);
+
     packetchain_comp_datasource *datasrcinfo = new packetchain_comp_datasource();
     datasrcinfo->ref_source = this;
 
@@ -96,100 +139,8 @@ void KisDatasourceLinuxBluetooth::proto_packet_linuxbtdevice(KVmap in_kvpairs) {
     get_source_packet_rrd()->add_sample(1, time(0));
 
     // Inject the packet into the packetchain if we have one
-    packetchain->ProcessPacket(packet);
-}
+    packetchain->process_packet(packet);
 
-kis_packet *
-    KisDatasourceLinuxBluetooth::handle_kv_btdevice(KisDatasourceCapKeyedObject *in_obj) {
-
-    kis_packet *packet = packetchain->GeneratePacket();
-
-    MsgpackAdapter::MsgpackStrMap dict;
-    msgpack::unpacked result;
-    MsgpackAdapter::MsgpackStrMap::iterator obj_iter;
-    std::vector<std::string> uuid_str_vec;
-
-    bluetooth_packinfo *bpi = new bluetooth_packinfo();
-
-    try {
-        msgpack::unpack(result, in_obj->object, in_obj->size);
-        msgpack::object deserialized = result.get();
-
-        dict = deserialized.as<MsgpackAdapter::MsgpackStrMap>();
-
-        if (clobber_timestamp && get_source_remote()) {
-            gettimeofday(&(packet->ts), NULL);
-        } else {
-            if ((obj_iter = dict.find("tv_sec")) != dict.end()) {
-                packet->ts.tv_sec = (time_t) obj_iter->second.as<uint64_t>();
-            } else {
-                throw std::runtime_error(std::string("tv_sec timestamp missing"));
-            }
-
-            if ((obj_iter = dict.find("tv_usec")) != dict.end()) {
-                packet->ts.tv_usec = (time_t) obj_iter->second.as<uint64_t>();
-            } else {
-                throw std::runtime_error(std::string("tv_usec timestamp missing"));
-            }
-        }
-
-        if ((obj_iter = dict.find("address")) != dict.end()) {
-            mac_addr m(obj_iter->second.as<std::string>());
-
-            if (m.error)
-                throw std::runtime_error(std::string("invalid mac address for btdevice"));
-
-            bpi->address = m;
-        } else {
-            throw std::runtime_error(std::string("address missing from bt device"));
-        }
-
-        if ((obj_iter = dict.find("name")) != dict.end()) {
-            bpi->name = obj_iter->second.as<std::string>();
-        }
-
-        if ((obj_iter = dict.find("txpower")) != dict.end()) {
-            bpi->txpower = obj_iter->second.as<int>();
-        } else {
-            // Spec says -127 - 127 so -256 is out of bounds
-            bpi->txpower = -256;
-        }
-
-        if ((obj_iter = dict.find("type")) != dict.end()) {
-            bpi->type = obj_iter->second.as<int>();
-        } else {
-            bpi->type = 4;
-        }
-
-        /* Optional uuid vector */
-        if ((obj_iter = dict.find("uuid_vec")) != dict.end()) {
-            MsgpackAdapter::AsStringVector(obj_iter->second, uuid_str_vec);
-
-            for (auto u : uuid_str_vec) {
-                uuid ui(u);
-
-                if (ui.error) {
-                    throw std::runtime_error(std::string("invalid uuid in service vec from "
-                                "bt device"));
-                }
-
-                bpi->service_uuid_vec.push_back(ui);
-            }
-        }
-    } catch (const std::exception& e) {
-        packetchain->DestroyPacket(packet);
-        delete(bpi);
-
-        std::stringstream ss;
-        ss << "failed to unpack btdevice bundle: " << e.what();
-        trigger_error(ss.str());
-        
-        return NULL;
-    }
-
-    packet->insert(pack_comp_btdevice, bpi);
-
-    return packet;
 }
 
 #endif

@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -21,15 +21,15 @@
 #include "gpstracker.h"
 #include "messagebus.h"
 
-GPSFake::GPSFake(GlobalRegistry *in_globalreg, SharedGpsBuilder in_builder) : 
-    KisGps(in_globalreg, in_builder) { }
+kis_gps_fake::kis_gps_fake(shared_gps_builder in_builder) : 
+    kis_gps(in_builder) { }
 
-GPSFake::~GPSFake() { }
+kis_gps_fake::~kis_gps_fake() { }
 
-bool GPSFake::open_gps(std::string in_opts) {
-    local_locker lock(&gps_mutex);
+bool kis_gps_fake::open_gps(std::string in_opts) {
+    local_locker lock(gps_mutex);
 
-    if (!KisGps::open_gps(in_opts)) {
+    if (!kis_gps::open_gps(in_opts)) {
         return false;
     }
 
@@ -37,9 +37,9 @@ bool GPSFake::open_gps(std::string in_opts) {
     std::string proto_lon;
     std::string proto_alt;
 
-    proto_lat = FetchOpt("lat", source_definition_opts);
-    proto_lon = FetchOpt("lon", source_definition_opts);
-    proto_alt = FetchOpt("alt", source_definition_opts);
+    proto_lat = fetch_opt("lat", source_definition_opts);
+    proto_lon = fetch_opt("lon", source_definition_opts);
+    proto_alt = fetch_opt("alt", source_definition_opts);
 
     gps_location = new kis_gps_packinfo();
 
@@ -69,12 +69,10 @@ bool GPSFake::open_gps(std::string in_opts) {
         gps_location->fix = 3;
     }
 
-    std::stringstream msg;
-    msg << "GPSVirtual setting location to " << gps_location->lat << "," <<
-        gps_location->lon << " @ " << gps_location->alt << "m";
-    _MSG(msg.str(), MSGFLAG_INFO);
+    _MSG_INFO("GPSVirtual using location {},{} @ {}", gps_location->lat,
+            gps_location->lon, gps_location->alt);
 
-    msg.str("");
+    std::stringstream msg;
     msg << "Virtual GPS at " << gps_location->lat << "," << 
         gps_location->lon << " @ " << gps_location->alt << "m";
     set_int_gps_description(msg.str());
@@ -86,16 +84,16 @@ bool GPSFake::open_gps(std::string in_opts) {
     return true;
 }
 
-kis_gps_packinfo *GPSFake::get_location() {
-    local_locker lock(&gps_mutex);
+kis_gps_packinfo *kis_gps_fake::get_location() {
+    local_locker lock(gps_mutex);
 
     gettimeofday(&(gps_location->tv), NULL);
 
     return gps_location;
 }
 
-kis_gps_packinfo *GPSFake::get_last_location() {
-    local_locker lock(&gps_mutex);
+kis_gps_packinfo *kis_gps_fake::get_last_location() {
+    local_locker lock(gps_mutex);
 
     gettimeofday(&(gps_last_location->tv), NULL);
 

@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -25,25 +25,28 @@
 
 #include <pwd.h>
 
-#include "globalregistry.h"
-#include "util.h"
+#ifdef HAVE_SENSORS_SENSORS_H
+#include <sensors/sensors.h>
+#endif
+
 #include "battery.h"
 #include "entrytracker.h"
-#include "system_monitor.h"
-#include "msgpack_adapter.h"
+#include "eventbus.h"
+#include "fmt.h"
+#include "globalregistry.h"
 #include "json_adapter.h"
+#include "kis_databaselogfile.h"
+#include "system_monitor.h"
+#include "util.h"
+#include "version.h"
 
-Systemmonitor::Systemmonitor(GlobalRegistry *in_globalreg) :
-    tracker_component(in_globalreg, 0),
-    Kis_Net_Httpd_CPPStream_Handler(in_globalreg) {
+Systemmonitor::Systemmonitor() :
+    lifetime_global() {
 
-    globalreg = in_globalreg;
+    devicetracker = Globalreg::fetch_mandatory_global_as<device_tracker>();
+    eventbus = Globalreg::fetch_mandatory_global_as<event_bus>();
 
-    devicetracker =
-        std::static_pointer_cast<Devicetracker>(globalreg->FetchGlobal("DEVICE_TRACKER"));
-
-    register_fields();
-    reserve_fields(NULL);
+    status = std::make_shared<tracked_system_status>();
 
 #ifdef SYS_LINUX
     // Get the bytes per page
@@ -51,17 +54,18 @@ Systemmonitor::Systemmonitor(GlobalRegistry *in_globalreg) :
 #endif
 
     struct timeval trigger_tm;
-    trigger_tm.tv_sec = globalreg->timestamp.tv_sec + 1;
+    trigger_tm.tv_sec = time(0) + 1;
     trigger_tm.tv_usec = 0;
 
+    auto timetracker = Globalreg::fetch_mandatory_global_as<time_tracker>();
     timer_id = 
-        globalreg->timetracker->RegisterTimer(0, &trigger_tm, 0, this);
+        timetracker->register_timer(0, &trigger_tm, 0, this);
 
     // Link the RRD out of the devicetracker
-    add_map(devicetracker->get_packets_rrd());
+    status->insert(devicetracker->get_packets_rrd());
 
     // Set the startup time
-    set_timestamp_start_sec(time(0));
+    status->set_timestamp_start_sec(time(0));
 
     // Get the userid
     char *pwbuf;
@@ -84,96 +88,155 @@ Systemmonitor::Systemmonitor(GlobalRegistry *in_globalreg) :
 
     delete[] pwbuf;
 
-    set_username(uidstr.str());
+    status->set_username(uidstr.str());
 
-    set_server_uuid(globalreg->server_uuid);
+    status->set_server_uuid(Globalreg::globalreg->server_uuid);
 
-    set_server_name(globalreg->kismet_config->FetchOpt("server_name"));
-    set_server_description(globalreg->kismet_config->FetchOpt("server_description"));
-    set_server_location(globalreg->kismet_config->FetchOpt("server_location"));
+    status->set_server_version(fmt::format("{}-{}-{}", VERSION_MAJOR, VERSION_MINOR, VERSION_TINY));
+    status->set_server_git(VERSION_GIT_COMMIT);
+    status->set_build_time(VERSION_BUILD_TIME);
+
+    status->set_server_name(Globalreg::globalreg->kismet_config->fetch_opt("server_name"));
+    status->set_server_description(Globalreg::globalreg->kismet_config->fetch_opt("server_description"));
+    status->set_server_location(Globalreg::globalreg->kismet_config->fetch_opt("server_location"));
+
+#if defined(SYS_LINUX) and defined(HAVE_SENSORS_SENSORS_H)
+    sensors_init(NULL);
+#endif
+
+    monitor_endp = 
+        std::make_shared<kis_net_httpd_simple_tracked_endpoint>("/system/status", 
+                status, &monitor_mutex);
+    user_monitor_endp =
+        std::make_shared<kis_net_httpd_simple_unauth_tracked_endpoint>("/system/user_status", 
+            [this](void) -> std::shared_ptr<tracker_element> {
+                auto use = std::make_shared<tracker_element_map>();
+
+                use->insert(status->get_tracker_username());
+
+                return use;
+            });
+    timestamp_endp = 
+        std::make_shared<kis_net_httpd_simple_tracked_endpoint>("/system/timestamp", 
+            [this](void) -> std::shared_ptr<tracker_element> {
+                auto tse = std::make_shared<tracker_element_map>();
+
+                tse->insert(status->get_tracker_timestamp_sec());
+                tse->insert(status->get_tracker_timestamp_usec());
+
+                struct timeval now;
+                gettimeofday(&now, NULL);
+
+                status->set_timestamp_sec(now.tv_sec);
+                status->set_timestamp_usec(now.tv_usec);
+
+                return tse;
+            });
+
+    if (Globalreg::globalreg->kismet_config->fetch_opt_bool("kis_log_system_status", true)) {
+        auto snap_time_s = 
+            Globalreg::globalreg->kismet_config->fetch_opt_as<unsigned int>("kis_log_system_status_rate", 30);
+
+        kismetdb_log_timer =
+            timetracker->register_timer(SERVER_TIMESLICES_SEC * snap_time_s, nullptr, 1, 
+                    [this](int) -> int {
+                        auto kismetdb = Globalreg::FetchGlobalAs<kis_database_logfile>();
+
+                        if (kismetdb == nullptr)
+                            return 1;
+
+                        struct timeval tv;
+                        gettimeofday(&tv, nullptr);
+
+                        std::stringstream js;
+
+                        {
+                            local_locker l(&monitor_mutex);
+                            Globalreg::globalreg->entrytracker->serialize("json", js, status, NULL);
+                        }
+
+                        kismetdb->log_snapshot(nullptr, tv, "SYSTEM", js.str());
+
+                        return 1;
+                    });
+    } else {
+        kismetdb_log_timer = -1;
+    }
+
+    // Always drop a SYSTEM snapshot as soon as the log opens
+    logopen_evt_id = 
+        eventbus->register_listener(kis_database_logfile::event_dblog_opened::Event(),
+            [this](std::shared_ptr<eventbus_event> evt) {
+                auto kismetdb = Globalreg::FetchGlobalAs<kis_database_logfile>();
+
+                if (kismetdb == nullptr)
+                    return;
+
+                struct timeval tv;
+                gettimeofday(&tv, nullptr);
+
+                std::stringstream js;
+
+                {
+                    local_locker l(&monitor_mutex);
+                    Globalreg::globalreg->entrytracker->serialize("json", js, status, NULL);
+                }
+
+                kismetdb->log_snapshot(nullptr, tv, "SYSTEM", js.str());
+            });
 
 }
 
 Systemmonitor::~Systemmonitor() {
-    local_eol_locker lock(&monitor_mutex);
+    local_locker lock(&monitor_mutex);
 
-    globalreg->RemoveGlobal("SYSTEM_MONITOR");
-    globalreg->timetracker->RemoveTimer(timer_id);
-}
+    Globalreg::globalreg->RemoveGlobal("SYSTEMMONITOR");
 
-void Systemmonitor::register_fields() {
-    RegisterField("kismet.system.battery.percentage", TrackerInt32,
-            "remaining battery percentage", &battery_perc);
-    RegisterField("kismet.system.battery.charging", TrackerString,
-            "battery charging state", &battery_charging);
-    RegisterField("kismet.system.battery.ac", TrackerUInt8,
-            "on AC power", &battery_ac);
-    RegisterField("kismet.system.battery.remaining", TrackerUInt32,
-            "battery remaining in seconds", &battery_remaining);
-
-    RegisterField("kismet.system.timestamp.sec", TrackerUInt64,
-            "system timestamp, seconds", &timestamp_sec);
-    RegisterField("kismet.system.timestamp.usec", TrackerUInt64,
-            "system timestamp, usec", &timestamp_usec);
-
-    RegisterField("kismet.system.timestamp.start_sec", TrackerUInt64,
-            "system startup timestamp, seconds", &timestamp_start_sec);
-
-    RegisterField("kismet.system.memory.rss", TrackerUInt64,
-            "memory RSS in kbytes", &memory);
-
-    RegisterField("kismet.system.devices.count", TrackerUInt64,
-            "number of devices in devicetracker", &devices);
-
-    RegisterField("kismet.system.user", TrackerString,
-            "user Kismet is running as", &username);
-
-    RegisterField("kismet.system.server_uuid", TrackerUuid,
-            "UUID of kismet server", &server_uuid);
-
-    RegisterField("kismet.system.server_name", TrackerString,
-            "Arbitrary name of server instance", &server_name);
-    RegisterField("kismet.system.server_description", TrackerString,
-            "Arbitrary server description", &server_description);
-    RegisterField("kismet.system.server_location", TrackerString,
-            "Arbitrary server location string", &server_location);
-
-    std::shared_ptr<kis_tracked_rrd<kis_tracked_rrd_extreme_aggregator> > rrd_builder(new kis_tracked_rrd<kis_tracked_rrd_extreme_aggregator>(globalreg, 0));
-
-    mem_rrd_id =
-        RegisterComplexField("kismet.system.memory.rrd", rrd_builder, 
-                "memory used RRD"); 
-
-    devices_rrd_id =
-        RegisterComplexField("kismet.system.devices.rrd", rrd_builder, 
-                "device count RRD");
-}
-
-void Systemmonitor::reserve_fields(SharedTrackerElement e) {
-    tracker_component::reserve_fields(e);
-
-    if (e != NULL) {
-        memory_rrd.reset(new kis_tracked_rrd<kis_tracked_rrd_extreme_aggregator>(globalreg, mem_rrd_id,
-                    e->get_map_value(mem_rrd_id)));
-        devices_rrd.reset(new kis_tracked_rrd<kis_tracked_rrd_extreme_aggregator>(globalreg, devices_rrd_id,
-                    e->get_map_value(devices_rrd_id)));
-    } else {
-        memory_rrd.reset(new kis_tracked_rrd<kis_tracked_rrd_extreme_aggregator>(globalreg, mem_rrd_id));
-        devices_rrd.reset(new kis_tracked_rrd<kis_tracked_rrd_extreme_aggregator>(globalreg, devices_rrd_id));
+    auto timetracker = Globalreg::FetchGlobalAs<time_tracker>("TIMETRACKER");
+    if (timetracker != nullptr) {
+        timetracker->remove_timer(timer_id);
+        timetracker->remove_timer(kismetdb_log_timer);
     }
 
-    add_map(memory_rrd);
-    add_map(devices_rrd);
+    eventbus->remove_listener(logopen_evt_id);
+}
+
+void tracked_system_status::register_fields() {
+    register_field("kismet.system.battery.percentage", "remaining battery percentage", &battery_perc);
+    register_field("kismet.system.battery.charging", "battery charging state", &battery_charging);
+    register_field("kismet.system.battery.ac", "on AC power", &battery_ac);
+    register_field("kismet.system.battery.remaining", 
+            "battery remaining in seconds", &battery_remaining);
+    register_field("kismet.system.timestamp.sec", "system timestamp, seconds", &timestamp_sec);
+    register_field("kismet.system.timestamp.usec", "system timestamp, usec", &timestamp_usec);
+    register_field("kismet.system.timestamp.start_sec", 
+            "system startup timestamp, seconds", &timestamp_start_sec);
+    register_field("kismet.system.memory.rss", "memory RSS in kbytes", &memory);
+    register_field("kismet.system.devices.count", "number of devices in devicetracker", &devices);
+    register_field("kismet.system.user", "user Kismet is running as", &username);
+    register_field("kismet.system.version", "Kismet version string", &server_version);
+    register_field("kismet.system.git", "Git commit string", &server_git);
+    register_field("kismet.system.build_time", "Server build time", &build_time);
+    register_field("kismet.system.server_uuid", "UUID of kismet server", &server_uuid);
+    register_field("kismet.system.server_name", "Arbitrary name of server instance", &server_name);
+    register_field("kismet.system.server_description", "Arbitrary server description", &server_description);
+    register_field("kismet.system.server_location", "Arbitrary server location string", &server_location);
+
+    register_field("kismet.system.memory.rrd", "memory used RRD", &memory_rrd); 
+    register_field("kismet.system.devices.rrd", "device count RRD", &devices_rrd);
+
+    register_field("kismet.system.sensors.fan", "fan sensors", &sensors_fans);
+    register_field("kismet.system.sensors.temp", "temperature sensors", &sensors_temp);
 }
 
 int Systemmonitor::timetracker_event(int eventid) {
     local_locker lock(&monitor_mutex);
 
-    int num_devices = devicetracker->FetchNumDevices();
+    int num_devices = devicetracker->fetch_num_devices();
 
     // Grab the devices
-    set_devices(num_devices);
-    devices_rrd->add_sample(num_devices, globalreg->timestamp.tv_sec);
+    status->set_devices(num_devices);
+    status->get_devices_rrd()->add_sample(num_devices, time(0));
 
 #ifdef SYS_LINUX
     // Grab the memory from /proc
@@ -193,7 +256,7 @@ int Systemmonitor::timetracker_event(int eventid) {
 
         if (paren != std::string::npos) {
             std::vector<std::string> toks = 
-                StrTokenize(procline.substr(paren + 1, procline.length()), " ");
+                str_tokenize(procline.substr(paren + 1, procline.length()), " ");
 
             if (toks.size() > 22) {
                 unsigned long int m;
@@ -203,8 +266,8 @@ int Systemmonitor::timetracker_event(int eventid) {
 
                     m /= 1024;
 
-                    set_memory(m);
-                    memory_rrd->add_sample(m, globalreg->timestamp.tv_sec);
+                    status->set_memory(m);
+                    status->get_memory_rrd()->add_sample(m, time(0));
                 }
             }
         }
@@ -212,20 +275,93 @@ int Systemmonitor::timetracker_event(int eventid) {
 
 #endif
 
+#if defined(SYS_LINUX) and defined(HAVE_SENSORS_SENSORS_H)
+    status->get_sensors_fans()->clear();
+    status->get_sensors_temp()->clear();
+
+    int sensor_nr = 0;
+    while (auto chip = sensors_get_detected_chips(NULL, &sensor_nr)) {
+        int i = 0;
+        while (auto fi = sensors_get_features(chip, &i)) {
+            char *label;
+            char chipname[64];
+            const char* adapter_name;
+            double val;
+            const sensors_subfeature *sf;
+
+            std::string synth_name;
+
+            switch (fi->type) {
+                case SENSORS_FEATURE_TEMP:
+                    sf = sensors_get_subfeature(chip, fi, SENSORS_SUBFEATURE_TEMP_INPUT);
+
+                    if (sf == nullptr)
+                        break;
+
+                    adapter_name = sensors_get_adapter_name(&chip->bus);
+                    sensors_snprintf_chip_name(chipname, 64, chip);
+                    label = sensors_get_label(chip, fi);
+                    sensors_get_value(chip, sf->number, &val);
+
+                    synth_name = fmt::format("{}-{}-{}", 
+                            munge_to_printable(chipname),
+                            munge_to_printable(label),
+                            munge_to_printable(adapter_name));
+
+                    status->get_sensors_temp()->insert(synth_name, 
+                            std::make_shared<tracker_element_double>(0, val));
+
+                    free(label);
+
+                    break;
+
+                case SENSORS_FEATURE_FAN:
+                    sf = sensors_get_subfeature(chip, fi, SENSORS_SUBFEATURE_FAN_INPUT);
+
+                    if (sf == nullptr)
+                        break;
+
+                    adapter_name = sensors_get_adapter_name(&chip->bus);
+                    sensors_snprintf_chip_name(chipname, 64, chip);
+                    label = sensors_get_label(chip, fi);
+                    sensors_get_value(chip, sf->number, &val);
+
+                    synth_name = fmt::format("{}-{}-{}", 
+                            munge_to_printable(chipname),
+                            munge_to_printable(label),
+                            munge_to_printable(adapter_name));
+
+                    status->get_sensors_fans()->insert(synth_name, 
+                            std::make_shared<tracker_element_double>(0, val));
+
+                    free(label);
+
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+
+#endif
+
     // Reschedule
     struct timeval trigger_tm;
-    trigger_tm.tv_sec = globalreg->timestamp.tv_sec + 1;
+    trigger_tm.tv_sec = time(0) + 1;
     trigger_tm.tv_usec = 0;
 
     timer_id = 
-        globalreg->timetracker->RegisterTimer(0, &trigger_tm, 0, this);
+        Globalreg::globalreg->timetracker->register_timer(0, &trigger_tm, 0, this);
 
     return 1;
 }
 
-void Systemmonitor::pre_serialize() {
+void tracked_system_status::pre_serialize() {
+    local_locker lock(&monitor_mutex);
+
     kis_battery_info batinfo;
-    Fetch_Battery_Info(&batinfo);
+    fetch_battery_info(&batinfo);
 
     set_battery_perc(batinfo.percentage);
     if (batinfo.ac && batinfo.charging) {
@@ -244,70 +380,5 @@ void Systemmonitor::pre_serialize() {
 
     set_timestamp_sec(now.tv_sec);
     set_timestamp_usec(now.tv_usec);
-}
-
-bool Systemmonitor::Httpd_VerifyPath(const char *path, const char *method) {
-    if (strcmp(method, "GET") != 0)
-        return false;
-
-    std::string stripped = Httpd_StripSuffix(path);
-
-    if (!Httpd_CanSerialize(path))
-        return false;
-
-    if (stripped == "/system/status")
-        return true;
-
-    if (stripped == "/system/timestamp")
-        return true;
-
-    return false;
-}
-
-void Systemmonitor::Httpd_CreateStreamResponse(
-        Kis_Net_Httpd *httpd __attribute__((unused)),
-        Kis_Net_Httpd_Connection *connection __attribute__((unused)),
-        const char *path, const char *method, 
-        const char *upload_data __attribute__((unused)),
-        size_t *upload_data_size __attribute__((unused)), 
-        std::stringstream &stream) {
-
-    local_locker lock(&monitor_mutex);
-
-    if (strcmp(method, "GET") != 0) {
-        return;
-    }
-
-    std::string stripped = Httpd_StripSuffix(path);
-
-    if (!Httpd_CanSerialize(path))
-        return;
-
-    std::shared_ptr<EntryTracker> entrytracker =
-        Globalreg::FetchGlobalAs<EntryTracker>(globalreg, "ENTRY_TRACKER");
-
-    if (stripped == "/system/status") {
-        entrytracker->Serialize(httpd->GetSuffix(path), stream,
-                Globalreg::FetchGlobalAs<Systemmonitor>(globalreg, "SYSTEM_MONITOR"), NULL);
-
-        return;
-    } else if (stripped == "/system/timestamp") {
-        SharedTrackerElement tse(new TrackerElement(TrackerMap, 0));
-
-        tse->add_map(timestamp_sec);
-        tse->add_map(timestamp_usec);
-
-        struct timeval now;
-        gettimeofday(&now, NULL);
-
-        set_timestamp_sec(now.tv_sec);
-        set_timestamp_usec(now.tv_usec);
-
-        entrytracker->Serialize(httpd->GetSuffix(path), stream, tse, NULL);
-
-        return;
-    } else {
-        return;
-    }
 }
 

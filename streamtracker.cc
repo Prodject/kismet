@@ -21,45 +21,45 @@
 #include "streamtracker.h"
 #include "entrytracker.h"
 
-StreamTracker::StreamTracker(GlobalRegistry *in_globalreg) :
-    Kis_Net_Httpd_CPPStream_Handler(in_globalreg), 
-    LifetimeGlobal() {
+stream_tracker::stream_tracker(global_registry *in_globalreg) :
+    kis_net_httpd_cppstream_handler(), 
+    lifetime_global() {
 
     globalreg = in_globalreg;
 
-    std::shared_ptr<EntryTracker> entrytracker = 
-        std::static_pointer_cast<EntryTracker>(globalreg->FetchGlobal("ENTRY_TRACKER"));
+    info_builder_id =
+        Globalreg::globalreg->entrytracker->register_field("kismet.stream.stream",
+                tracker_element_factory<streaming_info_record>(),
+                "Kismet data stream");
 
-    info_builder.reset(new streaming_info_record(globalreg, 0));
-    info_builder_id = entrytracker->RegisterField("kismet.stream.stream",
-            info_builder, "Export stream");
-
-    tracked_stream_map.reset(new TrackerElement(TrackerDoubleMap));
-    stream_map = TrackerElementDoubleMap(tracked_stream_map);
+    tracked_stream_map =
+        std::make_shared<tracker_element_double_map>();
 
     next_stream_id = 1;
+    
+    bind_httpd_server();
 }
 
-StreamTracker::~StreamTracker() {
-    local_eol_locker lock(&mutex);
+stream_tracker::~stream_tracker() {
+    local_locker lock(&mutex);
 }
 
-bool StreamTracker::Httpd_VerifyPath(const char *path, const char *method) {
+bool stream_tracker::httpd_verify_path(const char *path, const char *method) {
     local_demand_locker lock(&mutex);
 
     if (strcmp(method, "GET") != 0) 
         return false;
 
-    if (!Httpd_CanSerialize(path))
+    if (!httpd_can_serialize(path))
         return false;
 
-    std::string stripped = httpd->StripSuffix(path);
+    std::string stripped = httpd->strip_suffix(path);
 
     if (stripped == "/streams/all_streams") {
         return true;
     }
 
-    std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+    std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
     // /streams/by-id/[NUM]/stream_info
     // /streams/by-id/[NUM]/close_stream
@@ -78,7 +78,7 @@ bool StreamTracker::Httpd_VerifyPath(const char *path, const char *method) {
     ss >> sid;
 
     lock.lock();
-    if (stream_map.find(sid) == stream_map.end())
+    if (tracked_stream_map->find(sid) == tracked_stream_map->end())
         return false;
     lock.unlock();
 
@@ -91,9 +91,9 @@ bool StreamTracker::Httpd_VerifyPath(const char *path, const char *method) {
     return false;
 }
 
-void StreamTracker::Httpd_CreateStreamResponse(
-        Kis_Net_Httpd *httpd __attribute__((unused)),
-        Kis_Net_Httpd_Connection *connection,
+void stream_tracker::httpd_create_stream_response(
+        kis_net_httpd *httpd __attribute__((unused)),
+        kis_net_httpd_connection *connection,
         const char *path, const char *method, const char *upload_data,
         size_t *upload_data_size, std::stringstream &stream) {
 
@@ -103,24 +103,23 @@ void StreamTracker::Httpd_CreateStreamResponse(
         return;
     }
 
-    if (!Httpd_CanSerialize(path))
+    if (!httpd_can_serialize(path))
         return;
 
-    std::string stripped = httpd->StripSuffix(path);
+    std::string stripped = httpd->strip_suffix(path);
 
     if (stripped == "/streams/all_streams") {
-        SharedTrackerElement outvec(new TrackerElement(TrackerVector));
-        TrackerElementVector outv(outvec);
+        auto outvec = std::make_shared<tracker_element_vector>();
 
-        for (auto si = stream_map.begin(); si != stream_map.end(); ++si) {
-            outv.push_back(si->second);
+        for (auto si : *tracked_stream_map) {
+            outvec->push_back(si.second);
         }
 
-        Httpd_Serialize(path, stream, outvec);
+        httpd_serialize(path, stream, outvec, nullptr, connection);
         return;
     }
 
-    std::vector<std::string> tokenurl = StrTokenize(stripped, "/");
+    std::vector<std::string> tokenurl = str_tokenize(stripped, "/");
 
     // /streams/by-id/[NUM]/stream_info
     // /streams/by-id/[NUM]/close_stream
@@ -138,23 +137,23 @@ void StreamTracker::Httpd_CreateStreamResponse(
     std::stringstream ss(tokenurl[3]);
     ss >> sid;
 
-    auto smi = stream_map.find(sid);
+    auto smi = tracked_stream_map->find(sid);
 
-    if (smi == stream_map.end())
+    if (smi == tracked_stream_map->end())
         return;
 
     if (tokenurl[4] == "stream_info") {
-        Httpd_Serialize(path, stream, smi->second);
+        httpd_serialize(path, stream, smi->second, nullptr, connection);
         return;
     }
 
     if (tokenurl[4] == "close_stream") {
-        if (!httpd->HasValidSession(connection)) {
+        if (!httpd->has_valid_session(connection)) {
             connection->httpcode = 400;
             return;
         }
 
-        std::shared_ptr<streaming_info_record> ir = 
+        auto ir = 
             std::static_pointer_cast<streaming_info_record>(smi->second);
 
         ir->get_agent()->stop_stream("stream closed from web");
@@ -165,13 +164,13 @@ void StreamTracker::Httpd_CreateStreamResponse(
     }
 }
 
-void StreamTracker::register_streamer(streaming_agent *in_agent,
+void stream_tracker::register_streamer(streaming_agent *in_agent,
         std::string in_name, std::string in_type, std::string in_path, std::string in_description) {
 
     local_locker lock(&mutex);
 
-    std::shared_ptr<streaming_info_record> streamrec = 
-        std::static_pointer_cast<streaming_info_record>(info_builder->clone_type());
+    auto streamrec =
+        std::make_shared<streaming_info_record>(info_builder_id);
 
     streamrec->set_agent(in_agent);
     in_agent->set_stream_id(next_stream_id++);
@@ -181,22 +180,20 @@ void StreamTracker::register_streamer(streaming_agent *in_agent,
     streamrec->set_log_path(in_path);
     streamrec->set_log_description(in_description);
 
-    TrackerElementDoubleMap::pair p(in_agent->get_stream_id(), streamrec);
-    stream_map.insert(p);
+    tracked_stream_map->insert(in_agent->get_stream_id(), streamrec);
 }
 
-void StreamTracker::remove_streamer(double in_id) {
+void stream_tracker::remove_streamer(double in_id) {
     local_locker lock(&mutex);
 
-    auto si = stream_map.find(in_id);
+    auto si = tracked_stream_map->find(in_id);
 
-    if (si == stream_map.end())
+    if (si == tracked_stream_map->end())
         return;
 
-    std::shared_ptr<streaming_info_record> a =
-        std::static_pointer_cast<streaming_info_record>(si->second);
+    auto a = std::static_pointer_cast<streaming_info_record>(si->second);
     a->get_agent()->stop_stream("stream removed");
 
-    stream_map.erase(si);
+    tracked_stream_map->erase(si);
 }
 

@@ -448,7 +448,7 @@ int iwconfig_set_channel(const char *in_dev, int in_ch, char *in_err) {
     return 0;
 }
 
-int iwconfig_get_mode(const char *in_dev, char *in_err, int *in_mode) {
+int iwconfig_get_mode(const char *in_dev, char *in_err, unsigned int *in_mode) {
     struct iwreq wrq;
     int skfd;
 
@@ -476,7 +476,7 @@ int iwconfig_get_mode(const char *in_dev, char *in_err, int *in_mode) {
     return 0;
 }
 
-int iwconfig_set_mode(const char *in_dev, char *in_err, int in_mode) {
+int iwconfig_set_mode(const char *in_dev, char *in_err, unsigned int in_mode) {
     struct iwreq wrq;
     int skfd;
 
@@ -564,7 +564,7 @@ union iw_range_raw {
 
 /* Get hw supported channels; rewritten from wireless-tools by Jean Tourilhes */
 int iwconfig_get_chanlist(const char *interface, char *errstr, 
-        unsigned int **chan_list, unsigned int *chan_list_len) {
+        unsigned int **chan_list, size_t *chan_list_len) {
 	struct iwreq wrq;
 	int skfd;
 	char buffer[sizeof(struct iw_range) * 2];

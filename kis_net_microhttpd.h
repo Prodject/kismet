@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -21,6 +21,7 @@
 
 #include "config.h"
 
+#include <atomic>
 #include <stdio.h>
 #include <time.h>
 #include <list>
@@ -34,369 +35,44 @@
 
 #include "globalregistry.h"
 #include "kis_mutex.h"
+#include "kis_net_microhttpd_handlers.h"
+#include "structured.h"
 #include "trackedelement.h"
-#include "ringbuf2.h"
-#include "chainbuf.h"
-#include "buffer_handler.h"
 
-class Kis_Net_Httpd;
-class Kis_Net_Httpd_Session;
-class Kis_Net_Httpd_Connection;
+class kis_net_httpd;
+class kis_net_httpd_session;
+class kis_net_httpd_connection;
+class kis_net_httpd_handler;
 
-class EntryTracker;
+class entry_tracker;
 
-// Basic request handler from MHD
-class Kis_Net_Httpd_Handler {
-public:
-    Kis_Net_Httpd_Handler() { }
-    Kis_Net_Httpd_Handler(GlobalRegistry *in_globalreg);
-    virtual ~Kis_Net_Httpd_Handler();
+namespace kishttpd {
+    std::string get_suffix(const std::string& path);
+    std::string strip_suffix(const std::string& path);
+    std::string escape_html(const std::string& path);
 
-    // Bind a http server if we need to do that later in the instantiation
-    void Bind_Httpd_Server(GlobalRegistry *in_globalreg);
-
-    // Handle a GET request; must allocate the response mechanism via
-    // MHD_create_response_from_... and will typically call some other
-    // function to generate the data for the response
-    virtual int Httpd_HandleGetRequest(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size) = 0;
-
-    virtual int Httpd_HandlePostRequest(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection, 
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size) = 0;
-
-    // Can this handler process this request?
-    virtual bool Httpd_VerifyPath(const char *path, const char *method) = 0;
-
-    // Shortcut to checking if the serializer can handle this, since most
-    // endpoints will be implementing serialization
-    virtual bool Httpd_CanSerialize(std::string path);
-
-    // Shortcuts for getting path info
-    virtual std::string Httpd_GetSuffix(std::string path);
-    virtual std::string Httpd_StripSuffix(std::string path);
-
-
-    // By default, the Kismet HTTPD implementation will cache all POST variables
-    // in the variable_cache map in the connection record, and call
-    // Httpd_PostComplete(connection, stream&) to generate the output.
-    // If this is inappropriate for your endpoint, for instance if you are
-    // implementing some sort of file upload, then this function should
-    // return 'true' and you should implement it in Httpd_PostIterator
-    virtual bool Httpd_UseCustomPostIterator() {
-        return false;
-    }
-
-    // Called when a POST event is complete - all data has been uploaded and
-    // cached in the connection info.
-    virtual int Httpd_PostComplete(Kis_Net_Httpd_Connection *con __attribute__((unused))) {
-        return MHD_NO;
-    }
-
-    // If Httpd_UseCustomPostIterator() is true, this is expected to perform
-    // a custom handling of POST.  Properly handling post is non-trivial
-    //
-    // By default does nothing and bails on the post data.
-    //
-    // Override this to do useful post interpreting.  This implements parsing
-    // iterative data and will be called multiple times; if you are implementing
-    // a post system which takes multiple values you will need to index the state
-    // via the connection info and parse them all as you are called from the
-    // microhttpd handler.
-    virtual int Httpd_PostIterator(void *coninfo_cls __attribute__((unused)), 
-            enum MHD_ValueKind kind __attribute__((unused)), 
-            const char *key __attribute__((unused)), 
-            const char *filename __attribute__((unused)), 
-            const char *content_type __attribute__((unused)),
-            const char *transfer_encoding __attribute__((unused)), 
-            const char *data __attribute__((unused)), 
-            uint64_t off __attribute__((unused)), 
-            size_t size __attribute__((unused))) {
-        // Do nothing
-        return MHD_NO;
-    }
-
-    // If Httpd_UseCustomPostIterator() is true, this is expected to perform
-    // and cleanup at the end of handling a POST event, for instance, closing
-    // files, etc
-    virtual void Httpd_PostRequestCompleted(void *cls __attribute__((unused)),
-            struct MHD_Connection *connection __attribute__((unused)),
-            void **con_cls __attribute__((unused)),
-            enum MHD_RequestTerminationCode toe __attribute__((unused))) {
-        // Do nothing
-    }
-
-protected:
-    GlobalRegistry *http_globalreg;
-
-    std::shared_ptr<Kis_Net_Httpd> httpd;
-    std::shared_ptr<EntryTracker> entrytracker;
-
+    // Summarize based on a summarization dictionary, if one is present.
+    // MAY THROW EXCEPTIONS if summarization is malformed.
+    // Calls the standard, nested/vectorization summarization if passed a vector, single summarization
+    // if passed a map/trackedcomponent object.
+    // Modifies the rename_map field, which must be provided by the caller.
+    // Returns a summarized vector (if passed a vector) or summarized device (if passed
+    // a summarized device)
+    std::shared_ptr<tracker_element> summarize_with_structured(std::shared_ptr<tracker_element> in_data,
+            shared_structured structured, std::shared_ptr<tracker_element_serializer::rename_map> rename_map);
 };
-
-// Take a C++ stream and use it as a response
-class Kis_Net_Httpd_CPPStream_Handler : public Kis_Net_Httpd_Handler {
-public:
-    Kis_Net_Httpd_CPPStream_Handler() { }
-    Kis_Net_Httpd_CPPStream_Handler(GlobalRegistry *in_globalreg) :
-        Kis_Net_Httpd_Handler(in_globalreg) { };
-    virtual ~Kis_Net_Httpd_CPPStream_Handler() { };
-
-    virtual bool Httpd_VerifyPath(const char *path, const char *method) = 0;
-
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size, std::stringstream &stream) = 0;
-
-    virtual int Httpd_HandleGetRequest(Kis_Net_Httpd *httpd, 
-            Kis_Net_Httpd_Connection *connection,
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size);
-
-    virtual int Httpd_HandlePostRequest(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection, 
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size);
-
-    // Shortcuts to the entry tracker and serializer since most endpoints will
-    // need to serialize
-    virtual bool Httpd_Serialize(std::string path, std::stringstream &stream,
-            SharedTrackerElement e, 
-            TrackerElementSerializer::rename_map *name_map = NULL);
-};
-
-// Fallback handler to report that we can't serve static files
-class Kis_Net_Httpd_No_Files_Handler : public Kis_Net_Httpd_CPPStream_Handler {
-public:
-    virtual bool Httpd_VerifyPath(const char *path, const char *method);
-
-    virtual void Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size, std::stringstream &stream);
-};
-
-// A buffer-based stream handler which will continually stream output from
-// the buffer to the HTTP connection
-//
-// Because this is a long-running handler, it must track the buffer state
-// inside a connection object.
-class Kis_Net_Httpd_Buffer_Stream_Handler : public Kis_Net_Httpd_Handler {
-public:
-    Kis_Net_Httpd_Buffer_Stream_Handler() : Kis_Net_Httpd_Handler() {
-        // Default rb size
-        k_n_h_r_ringbuf_size = 1024*1024*4;
-    }
-    Kis_Net_Httpd_Buffer_Stream_Handler(GlobalRegistry *in_globalreg) :
-        Kis_Net_Httpd_Handler(in_globalreg) { 
-        // Default rb size
-        k_n_h_r_ringbuf_size = 1024*1024*4;
-    };
-    virtual ~Kis_Net_Httpd_Buffer_Stream_Handler();
-
-    virtual int Httpd_HandleGetRequest(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size);
-    virtual int Httpd_HandlePostRequest(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection, 
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size);
-
-    // Can this handler process this request?
-    virtual bool Httpd_VerifyPath(const char *path, const char *method) = 0;
-
-    // Called as a connection is being set up; responsible for populating
-    //
-    // Returns:
-    //  MHD_NO  - Streambuffer should not automatically close out the buffer; this
-    //            is used when spawning an independent thread for managing the stream,
-    //            for example with pcap streaming
-    //  MHD_YES - Streambuffer should automatically close the buffer when the
-    //            streamresponse is complete, typically used when streaming a finite
-    //            amount of data through a memchunk buffer like a json serialization
-    virtual int Httpd_CreateStreamResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection,
-            const char *url, const char *method, const char *upload_data,
-            size_t *upload_data_size) = 0;
-
-    // Called when a POST event is complete - all data has been uploaded and
-    // cached in the connection info.
-    //
-    // Returns:
-    //  MHD_NO  - Streambuffer should not automatically close out the buffer
-    //  MHD_YES - Streambuffer should automatically close the buffer when the
-    //            streamresponse is complete
-    virtual int Httpd_PostComplete(Kis_Net_Httpd_Connection *con __attribute__((unused))) = 0;
-
-    // Called by microhttpd during servicing a connecting; cls is a 
-    // kis_net_httpd_buffer_stream_aux which contains all our references to
-    // this class instance, the buf streams, etc.  Locks waiting for the
-    // buf to have data available to write.
-    static ssize_t buffer_event_cb(void *cls, uint64_t pos, char *buf, size_t max);
-
-    virtual void Httpd_Set_Buffer_Size(size_t in_sz) {
-        k_n_h_r_ringbuf_size = in_sz;
-    }
-
-protected:
-    virtual std::shared_ptr<BufferHandlerGeneric> allocate_buffer() = 0;
-
-    size_t k_n_h_r_ringbuf_size;
-};
-
-// Ringbuf-based stream handler
-class Kis_Net_Httpd_Ringbuf_Stream_Handler : public Kis_Net_Httpd_Buffer_Stream_Handler {
-public:
-    Kis_Net_Httpd_Ringbuf_Stream_Handler() : Kis_Net_Httpd_Buffer_Stream_Handler() { }
-
-    Kis_Net_Httpd_Ringbuf_Stream_Handler(GlobalRegistry *in_globalreg) :
-        Kis_Net_Httpd_Buffer_Stream_Handler(in_globalreg) { }
-
-protected:
-    virtual std::shared_ptr<BufferHandlerGeneric> allocate_buffer() {
-        return std::static_pointer_cast<BufferHandlerGeneric>(std::shared_ptr<BufferHandler<RingbufV2> >(new BufferHandler<RingbufV2>(0, k_n_h_r_ringbuf_size)));
-    }
-};
-
-class Kis_Net_Httpd_Chain_Stream_Handler : public Kis_Net_Httpd_Buffer_Stream_Handler {
-public:
-    Kis_Net_Httpd_Chain_Stream_Handler() : Kis_Net_Httpd_Buffer_Stream_Handler() { }
-
-    Kis_Net_Httpd_Chain_Stream_Handler(GlobalRegistry *in_globalreg) :
-        Kis_Net_Httpd_Buffer_Stream_Handler(in_globalreg) { }
-
-protected:
-    virtual std::shared_ptr<BufferHandlerGeneric> allocate_buffer() {
-        // Allocate a buffer directly, in a multiple of the max output size for the webserver
-        // buffer
-        return std::static_pointer_cast<BufferHandlerGeneric>(std::shared_ptr<BufferHandler<Chainbuf> >(new BufferHandler<Chainbuf>(NULL, new Chainbuf(64 * 1024, 512))));
-    }
-
-};
-
-// A buffer-stream auxiliary class which is passed to the callback, added to the
-// connection record.  This holds the per-connection states.
-//
-// Free_aux_cb is called to free any aux data added into this record; the stream_aux
-// itself will be freed by the httpd system.
-class Kis_Net_Httpd_Buffer_Stream_Aux : public BufferInterface {
-public:
-    Kis_Net_Httpd_Buffer_Stream_Aux(Kis_Net_Httpd_Buffer_Stream_Handler *in_handler,
-            Kis_Net_Httpd_Connection *in_httpd_connection, 
-            std::shared_ptr<BufferHandlerGeneric> in_ringbuf_handler,
-            void *in_aux,
-            std::function<void (Kis_Net_Httpd_Buffer_Stream_Aux *)> in_free_aux);
-
-    virtual ~Kis_Net_Httpd_Buffer_Stream_Aux();
-
-    bool get_in_error() { 
-        local_locker lock(&error_mutex);
-        return in_error;
-    }
-
-    void trigger_error() {
-        // Scope so we're done with our mutex by the time we release the conditional
-        // locker
-        local_demand_locker lock(&error_mutex);
-        lock.lock();
-        in_error = true;
-        lock.unlock();
-
-        // Unlock the conditional locker
-        cl->unlock(0);
-
-    }
-
-    void set_aux(void *in_aux, 
-            std::function<void (Kis_Net_Httpd_Buffer_Stream_Aux *)> in_free_aux) {
-        local_locker lock(&aux_mutex);
-
-        aux = in_aux;
-        free_aux_cb = in_free_aux;
-    }
-
-    void set_sync(std::function<void (Kis_Net_Httpd_Buffer_Stream_Aux *)> in_cb) {
-        local_locker lock(&aux_mutex);
-
-        sync_cb = in_cb;
-    }
-
-    void sync() {
-        local_locker lock(&aux_mutex);
-
-        if (sync_cb)
-            sync_cb(this);
-    }
-
-    // RBI interface to notify when data is in the buffer
-    virtual void BufferAvailable(size_t in_amt);
-
-    // Let the httpd callback pull the rb handler out
-    std::shared_ptr<BufferHandlerGeneric> get_rbhandler() { return ringbuf_handler; }
-
-    // Block until data is available (called by the buffer_event_cb in the http
-    // session)
-    void block_until_data();
-
-    // Get the buffer event mutex
-    kis_recursive_timed_mutex *get_buffer_event_mutex() {
-        return &buffer_event_mutex;
-    }
-
-public:
-    kis_recursive_timed_mutex aux_mutex;
-    kis_recursive_timed_mutex error_mutex;
-    kis_recursive_timed_mutex buffer_event_mutex;
-
-    // Stream handler we belong to
-    Kis_Net_Httpd_Buffer_Stream_Handler *httpd_stream_handler;
-
-    // kis httpd connection we belong to
-    Kis_Net_Httpd_Connection *httpd_connection;
-
-    // Buffer handler
-    std::shared_ptr<BufferHandlerGeneric> ringbuf_handler;
-
-    // Conditional locker while waiting for the stream to have data
-    std::shared_ptr<conditional_locker<int> > cl;
-
-    // Are we in error?
-    bool in_error;
-
-    // Possible worker thread for processing the buffer fill
-    std::thread generator_thread;
-
-    // Additional arbitrary data - Used by the buffer streamer to store the
-    // buffer processor, and by the CPP Streamer to store the streambuf
-    void *aux;
-
-    // Free function
-    std::function<void (Kis_Net_Httpd_Buffer_Stream_Aux *)> free_aux_cb;
-
-    // Sync function; called to make sure the buffer is flushed and fully synced 
-    // prior to flagging it complete
-    std::function<void (Kis_Net_Httpd_Buffer_Stream_Aux *)> sync_cb;
-    
-};
-
-
-#define KIS_SESSION_COOKIE      "KISMET"
-#define KIS_HTTPD_POSTBUFFERSZ  (1024 * 32)
 
 // Connection data, generated for all requests by the processing system;
 // contains per-handler states, request information, request type, session
 // data if known, POST variables if the standard POST processing is enabled
-class Kis_Net_Httpd_Connection {
+class kis_net_httpd_connection {
 public:
+    using variable_cache_map = std::map<std::string, std::shared_ptr<std::stringstream>>;
+
     const static int CONNECTION_GET = 0;
     const static int CONNECTION_POST = 1;
 
-    Kis_Net_Httpd_Connection() {
+    kis_net_httpd_connection() {
         httpcode = 200;
         postprocessor = NULL;
         post_complete = false;
@@ -413,7 +89,28 @@ public:
     std::stringstream response_stream;
 
     // Cache of variables in session
-    std::map<std::string, std::unique_ptr<std::stringstream> > variable_cache;
+    variable_cache_map variable_cache;
+
+    bool has_cached_variable(const std::string& key) {
+        return (variable_cache.find(key) != variable_cache.end());
+    }
+
+    template <typename T>
+    T variable_cache_as(const std::string& key) {
+        T t;
+
+        auto v = variable_cache.find(key);
+
+        if (v == variable_cache.end())
+            throw std::runtime_error(fmt::format("variable '{}' not found", kishttpd::escape_html(key)));
+
+        *v->second >> t;
+
+        if (v->second->fail())
+            throw std::runtime_error(fmt::format("unable to convert value of '{}'", kishttpd::escape_html(key)));
+
+        return t;
+    }
 
     // Optional alternate filename to pass to the browser for downloading
     std::string optional_filename;
@@ -423,6 +120,9 @@ public:
 
     // URL
     std::string url;
+
+    // URL component considered for mime typing
+    std::string mime_url;
 
     // Post processor struct
     struct MHD_PostProcessor *postprocessor;
@@ -434,13 +134,13 @@ public:
     int connection_type;
 
     // httpd parent
-    Kis_Net_Httpd *httpd;    
+    kis_net_httpd *httpd;    
 
     // Handler
-    Kis_Net_Httpd_Handler *httpdhandler;    
+    kis_net_httpd_handler *httpdhandler;    
 
     // Login session
-    std::shared_ptr<Kis_Net_Httpd_Session> session;
+    std::shared_ptr<kis_net_httpd_session> session;
 
     // Connection
     struct MHD_Connection *connection;
@@ -455,7 +155,7 @@ public:
     std::mutex connection_mutex;
 };
 
-class Kis_Net_Httpd_Session {
+class kis_net_httpd_session {
 public:
     // Session ID
     std::string sessionid;
@@ -470,83 +170,263 @@ public:
     time_t session_lifetime;
 };
 
-class Kis_Httpd_Websession;
+class kis_httpd_websession;
 
-class Kis_Net_Httpd : public LifetimeGlobal {
+// Do a simple dump of a tracked object into an endpoint
+class kis_net_httpd_simple_tracked_endpoint : public kis_net_httpd_chain_stream_handler {
 public:
-    static std::shared_ptr<Kis_Net_Httpd> create_httpd(GlobalRegistry *in_globalreg) {
-        std::shared_ptr<Kis_Net_Httpd> mon(new Kis_Net_Httpd(in_globalreg));
-        in_globalreg->RegisterLifetimeGlobal(mon);
-        in_globalreg->InsertGlobal("HTTPD_SERVER", mon);
+    using gen_func = std::function<std::shared_ptr<tracker_element> ()>;
+
+    kis_net_httpd_simple_tracked_endpoint(const std::string& in_uri, 
+            std::shared_ptr<tracker_element> in_content, 
+            kis_recursive_timed_mutex *in_mutex);
+    kis_net_httpd_simple_tracked_endpoint(const std::string& in_uri, gen_func in_func);
+    kis_net_httpd_simple_tracked_endpoint(const std::string& in_uri, gen_func in_func,
+            kis_recursive_timed_mutex *in_mutex);
+
+    virtual ~kis_net_httpd_simple_tracked_endpoint() { }
+
+    // HTTP handlers
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
+
+    virtual int httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
+            const char *url, const char *method, const char *upload_data,
+            size_t *upload_data_size) override;
+
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls) override;
+
+protected:
+    std::string uri;
+    std::shared_ptr<tracker_element> content;
+    gen_func generator;
+    kis_recursive_timed_mutex *mutex;
+};
+
+// Do a simple dump of a tracked object into an endpoint, DO NOT require authentication.
+// This should be very rarely used.
+class kis_net_httpd_simple_unauth_tracked_endpoint : public kis_net_httpd_chain_stream_handler {
+public:
+    using gen_func = std::function<std::shared_ptr<tracker_element> ()>;
+
+    kis_net_httpd_simple_unauth_tracked_endpoint(const std::string& in_uri, 
+            std::shared_ptr<tracker_element> in_content, 
+            kis_recursive_timed_mutex *in_mutex);
+    kis_net_httpd_simple_unauth_tracked_endpoint(const std::string& in_uri, gen_func in_func);
+    kis_net_httpd_simple_unauth_tracked_endpoint(const std::string& in_uri, gen_func in_func,
+            kis_recursive_timed_mutex *in_mutex);
+
+    virtual ~kis_net_httpd_simple_unauth_tracked_endpoint() { }
+
+    // HTTP handlers
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
+
+    virtual int httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
+            const char *url, const char *method, const char *upload_data,
+            size_t *upload_data_size) override;
+
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls) override;
+
+protected:
+    std::string uri;
+    std::shared_ptr<tracker_element> content;
+    gen_func generator;
+    kis_recursive_timed_mutex *mutex;
+};
+
+// A similar simplified endpoint dump but with a callback function for the path processing
+// and for the endpoint generation; for more rest-like paths
+class kis_net_httpd_path_tracked_endpoint : public kis_net_httpd_chain_stream_handler {
+public:
+    using gen_func = std::function<std::shared_ptr<tracker_element> (const std::vector<std::string>&)>;
+    using path_func = std::function<bool (const std::vector<std::string>&)>;
+
+    kis_net_httpd_path_tracked_endpoint(path_func in_path, gen_func in_gen);
+    kis_net_httpd_path_tracked_endpoint(path_func in_path, gen_func in_gen,
+            kis_recursive_timed_mutex *in_mutex);
+    virtual ~kis_net_httpd_path_tracked_endpoint() { }
+
+    // HTTP handlers
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
+
+    virtual int httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
+            const char *url, const char *method, const char *upload_data,
+            size_t *upload_data_size) override;
+
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls) override;
+
+protected:
+    path_func path;
+    gen_func generator;
+    kis_recursive_timed_mutex *mutex;
+};
+
+
+// Extremely simple callback-based POST responder linked to a chainbuf buffer
+class kis_net_httpd_simple_post_endpoint : public kis_net_httpd_chain_stream_handler {
+public:
+    using handler_func = 
+        std::function<unsigned int (std::ostream& stream, const std::string& uri, shared_structured post_structured,
+                kis_net_httpd_connection::variable_cache_map& variable_cache)>;
+
+    kis_net_httpd_simple_post_endpoint(const std::string& in_uri, handler_func in_func,
+            kis_recursive_timed_mutex *in_mutex);
+    kis_net_httpd_simple_post_endpoint(const std::string& in_uri, handler_func in_func);
+
+    virtual ~kis_net_httpd_simple_post_endpoint() { }
+
+    // HTTP handlers
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
+
+    virtual int httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
+            const char *url, const char *method, const char *upload_data,
+            size_t *upload_data_size) override;
+
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls) override;
+
+protected:
+    std::string uri;
+    handler_func generator;
+    kis_recursive_timed_mutex *mutex;
+};
+
+// Path-based basic post responder linked to a chainbuf buffer
+class kis_net_httpd_path_post_endpoint : public kis_net_httpd_chain_stream_handler {
+public:
+    using path_func = std::function<bool (const std::vector<std::string>& path, const std::string& uri)>;
+    using handler_func = 
+        std::function<unsigned int (std::ostream& stream, 
+                const std::vector<std::string>& path, const std::string& uri, 
+                shared_structured post_structured,
+                kis_net_httpd_connection::variable_cache_map& variable_cache)>;
+
+    kis_net_httpd_path_post_endpoint(path_func in_path, handler_func in_func);
+    kis_net_httpd_path_post_endpoint(path_func in_path, handler_func in_func,
+            kis_recursive_timed_mutex *in_mutex);
+
+    virtual ~kis_net_httpd_path_post_endpoint() { }
+
+    // HTTP handlers
+    virtual bool httpd_verify_path(const char *path, const char *method) override;
+
+    virtual int httpd_create_stream_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection,
+            const char *url, const char *method, const char *upload_data,
+            size_t *upload_data_size) override;
+
+    virtual int httpd_post_complete(kis_net_httpd_connection *concls) override;
+
+protected:
+    path_func path;
+    handler_func generator;
+    kis_recursive_timed_mutex *mutex;
+};
+
+#define KIS_SESSION_COOKIE      "KISMET"
+#define KIS_HTTPD_POSTBUFFERSZ  (1024 * 32)
+
+class kis_net_httpd : public lifetime_global {
+public:
+    static std::string global_name() { return "HTTPD_SERVER"; }
+
+    static std::shared_ptr<kis_net_httpd> create_httpd() {
+        std::shared_ptr<kis_net_httpd> mon(new kis_net_httpd());
+        Globalreg::globalreg->register_lifetime_global(mon);
+        Globalreg::globalreg->insert_global(global_name(), mon);
         return mon;
     }
 
 private:
-    Kis_Net_Httpd(GlobalRegistry *in_globalreg);
+    kis_net_httpd();
 
 public:
-    virtual ~Kis_Net_Httpd();
+    virtual ~kis_net_httpd();
 
-    int StartHttpd();
-    int StopHttpd();
+    int start_httpd();
+    int stop_httpd();
 
-    bool HttpdRunning() { return running; }
-    unsigned int FetchPort() { return http_port; };
-    bool FetchUsingSSL() { return use_ssl; };
+    bool httpd_running() { return running; }
+    unsigned int fetch_port() { return http_port; };
+    bool fetch_using_ssl() { return use_ssl; };
 
-    void RegisterSessionHandler(std::shared_ptr<Kis_Httpd_Websession> in_session);
+    void register_session_handler(std::shared_ptr<kis_httpd_websession> in_session);
 
-    void RegisterHandler(Kis_Net_Httpd_Handler *in_handler);
-    void RemoveHandler(Kis_Net_Httpd_Handler *in_handler);
+    // All standard handlers require a login
+    void register_handler(kis_net_httpd_handler *in_handler);
+    void remove_handler(kis_net_httpd_handler *in_handler);
 
-    static std::string GetSuffix(std::string url);
-    static std::string StripSuffix(std::string url);
+    // Unauth handlers do not require a login; use of them should be very limited.
+    void register_unauth_handler(kis_net_httpd_handler *in_handler);
+    void remove_unauth_handler(kis_net_httpd_handler *in_handler);
 
-    void RegisterMimeType(std::string suffix, std::string mimetype);
-    std::string GetMimeType(std::string suffix);
+    static std::string get_suffix(std::string url);
+    static std::string strip_suffix(std::string url);
+
+    void register_mime_type(std::string suffix, std::string mimetype);
+    std::string get_mime_type(std::string suffix);
 
     // Register a static files directory (used for system, home, and plugin data)
-    void RegisterStaticDir(std::string in_url_prefix, std::string in_path);
+    void register_static_dir(std::string in_url_prefix, std::string in_path);
+
+    // Fixed alias/rewrites
+    void register_alias(const std::string& in_alias, const std::string& in_dest);
+    void remove_alias(const std::string& in_alias);
 
     // Interrogate the session handler and figure out if this connection has a
     // valid session; optionally sends basic auth failure automatically
-    bool HasValidSession(Kis_Net_Httpd_Connection *connection, bool send_reject = true);
+    bool has_valid_session(kis_net_httpd_connection *connection, bool send_reject = true);
 
     // Create a session; if connection is not null, insert session into connection.
     // If response is not null, append to the response
-    void CreateSession(Kis_Net_Httpd_Connection *connection, 
+    std::shared_ptr<kis_net_httpd_session> create_session(kis_net_httpd_connection *connection, 
             struct MHD_Response *response, time_t in_lifetime);
 
     // Append a session cookie if we have a valid session for this connection
-    static void AppendHttpSession(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection);
+    static void append_http_session(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection);
 
     // Append timestamp and mime headers
-    static void AppendStandardHeaders(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection, const char *url);
+    static void append_standard_headers(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection, const char *url);
+
+    // Append CORS cross-site headers
+    static void append_cors_headers(kis_net_httpd *httpd,
+            struct MHD_Connection *connection,
+            struct MHD_Response *response);
 
     // Queue a http response
-    static int SendHttpResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection);
+    static int send_http_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection);
 
     // Send a standard HTTP response appending the session and standard 
     // headers
-    static int SendStandardHttpResponse(Kis_Net_Httpd *httpd,
-            Kis_Net_Httpd_Connection *connection, const char *url);
+    static int send_standard_http_response(kis_net_httpd *httpd,
+            kis_net_httpd_connection *connection, const char *url);
 
     // Catch MHD panics and try to close more elegantly
     static void MHD_Panic(void *cls, const char *file, unsigned int line,
             const char *reason);
 
 protected:
-    GlobalRegistry *globalreg;
-
     unsigned int http_port;
+    std::string http_host;
 
     bool http_serve_files, http_serve_user_files;
 
+    std::string uri_prefix;
+
     struct MHD_Daemon *microhttpd;
-    std::vector<Kis_Net_Httpd_Handler *> handler_vec;
+
+    // Vector of unauthorized handlers that do not need a login; there should be very very few
+    // of these.  Static file handlers, and the very basic user name handler to make the initial
+    // login display are about the only ones
+    std::vector<kis_net_httpd_handler *> unauth_handler_vec;
+
+    // General handler vec.  All of these require a valid login.
+    std::vector<kis_net_httpd_handler *> handler_vec;
 
     std::string conf_username, conf_password;
 
@@ -554,9 +434,14 @@ protected:
     char *cert_pem, *cert_key;
     std::string pem_path, key_path;
 
+    bool allow_cors;
+    std::string allowed_cors_referrer;
+
     bool running;
 
     std::map<std::string, std::string> mime_type_map;
+
+    std::map<std::string, std::string> alias_rewrite_map;
 
     class static_dir {
     public:
@@ -572,6 +457,7 @@ protected:
     std::vector<static_dir> static_dir_vec;
 
     kis_recursive_timed_mutex controller_mutex;
+    kis_recursive_timed_mutex session_mutex;
 
     // Handle the requests and dispatch to controllers
     static int http_request_handler(void *cls, struct MHD_Connection *connection,
@@ -581,7 +467,7 @@ protected:
     static void http_request_completed(void *cls, struct MHD_Connection *connection,
             void **con_cls, enum MHD_RequestTerminationCode toe);
 
-    static int handle_static_file(void *cls, Kis_Net_Httpd_Connection *connection,
+    static int handle_static_file(void *cls, kis_net_httpd_connection *connection,
             const char *url, const char *method);
 
     static int http_post_handler(void *coninfo_cls, enum MHD_ValueKind kind, 
@@ -591,18 +477,21 @@ protected:
 
     char *read_ssl_file(std::string in_fname);
 
-    void AddSession(std::shared_ptr<Kis_Net_Httpd_Session> in_session);
-    void DelSession(std::string in_key);
-    void DelSession(std::map<std::string, std::shared_ptr<Kis_Net_Httpd_Session> >::iterator in_itr);
-    void WriteSessions();
+    void add_session(std::shared_ptr<kis_net_httpd_session> in_session);
+    void del_session(std::string in_key);
+    void del_session(std::map<std::string, std::shared_ptr<kis_net_httpd_session>>::iterator in_itr);
+    // Find a valid session; will return a session or nullptr if no session key is found, or if the
+    // session is found but expired.
+    std::shared_ptr<kis_net_httpd_session> FindSession(const std::string& in_session_key);
+    void write_sessions();
 
-    std::map<std::string, std::shared_ptr<Kis_Net_Httpd_Session> > session_map;
+    std::map<std::string, std::shared_ptr<kis_net_httpd_session>> session_map;
 
     bool store_sessions;
     std::string sessiondb_file;
-    ConfigFile *session_db;
+    config_file *session_db;
 
-    std::shared_ptr<Kis_Httpd_Websession> websession;
+    std::shared_ptr<kis_httpd_websession> websession;
     unsigned int session_timeout;
 
 };

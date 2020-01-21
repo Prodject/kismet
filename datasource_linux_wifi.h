@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -25,20 +25,20 @@
 
 #include "kis_datasource.h"
 
-class KisDatasourceLinuxWifi;
-typedef std::shared_ptr<KisDatasourceLinuxWifi> SharedDatasourceLinuxWifi;
+class kis_datasource_linux_wifi;
+typedef std::shared_ptr<kis_datasource_linux_wifi> shared_datasource_linux_wifi;
 
-class KisDatasourceLinuxWifi : public KisDatasource {
+class kis_datasource_linux_wifi : public kis_datasource {
 public:
-    KisDatasourceLinuxWifi(GlobalRegistry *in_globalreg, 
-            SharedDatasourceBuilder in_builder) :
-        KisDatasource(in_globalreg, in_builder) {
+    kis_datasource_linux_wifi(shared_datasource_builder in_builder,
+            std::shared_ptr<kis_recursive_timed_mutex> mutex) :
+        kis_datasource(in_builder, mutex) {
 
         // Set the capture binary
         set_int_source_ipc_binary("kismet_cap_linux_wifi");
     }
 
-    virtual ~KisDatasourceLinuxWifi() { };
+    virtual ~kis_datasource_linux_wifi() { };
 
     // Almost all of the logic is implemented in the capture binary and derived
     // from our prototype; all the list, probe, etc functions proxy to our binary
@@ -48,41 +48,40 @@ public:
 };
 
 
-class DatasourceLinuxWifiBuilder : public KisDatasourceBuilder {
+class datasource_linux_wifi_builder : public kis_datasource_builder {
 public:
-    DatasourceLinuxWifiBuilder(GlobalRegistry *in_globalreg, int in_id) :
-        KisDatasourceBuilder(in_globalreg, in_id) {
+    datasource_linux_wifi_builder(int in_id) :
+        kis_datasource_builder(in_id) {
 
         register_fields();
         reserve_fields(NULL);
         initialize();
     }
 
-    DatasourceLinuxWifiBuilder(GlobalRegistry *in_globalreg, int in_id,
-        SharedTrackerElement e) :
-        KisDatasourceBuilder(in_globalreg, in_id, e) {
+    datasource_linux_wifi_builder(int in_id, std::shared_ptr<tracker_element_map> e) :
+        kis_datasource_builder(in_id, e) {
 
         register_fields();
         reserve_fields(e);
         initialize();
     }
 
-    DatasourceLinuxWifiBuilder(GlobalRegistry *in_globalreg) :
-        KisDatasourceBuilder(in_globalreg, 0) {
+    datasource_linux_wifi_builder() :
+        kis_datasource_builder() {
 
         register_fields();
         reserve_fields(NULL);
         initialize();
     }
 
-    virtual ~DatasourceLinuxWifiBuilder() { }
+    virtual ~datasource_linux_wifi_builder() { }
 
-    virtual SharedDatasource build_datasource(SharedDatasourceBuilder in_sh_this) {
-        return SharedDatasourceLinuxWifi(new KisDatasourceLinuxWifi(globalreg, 
-                    in_sh_this));
+    virtual shared_datasource build_datasource(shared_datasource_builder in_sh_this,
+            std::shared_ptr<kis_recursive_timed_mutex> mutex) override {
+        return shared_datasource_linux_wifi(new kis_datasource_linux_wifi(in_sh_this, mutex));
     }
 
-    virtual void initialize() {
+    virtual void initialize() override {
         // Set up our basic parameters for the linux wifi driver
         
         set_source_type("linuxwifi");
@@ -113,6 +112,8 @@ public:
 
         // We allow tuning, sure
         set_tune_capable(true);
+
+        set_hop_capable(true);
     }
 };
 

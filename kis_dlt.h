@@ -7,7 +7,7 @@
     (at your option) any later version.
 
     Kismet is distributed in the hope that it will be useful,
-      but WITHOUT ANY WARRANTY; without even the implied warranty of
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
@@ -27,20 +27,17 @@
 #include "packet.h"
 #include "packetchain.h"
 
-class Kis_DLT_Handler : public SharedGlobalData {
+class kis_dlt_handler : public lifetime_global {
 public:
-	Kis_DLT_Handler() { fprintf(stderr, "FATAL OOPS: Kis_DLT_Handler()\n"); exit(1); }
-	Kis_DLT_Handler(GlobalRegistry *in_globalreg);
+	kis_dlt_handler();
+	virtual ~kis_dlt_handler();
 
-	virtual int HandlePacket(kis_packet *in_pack) = 0;
+	virtual int handle_packet(kis_packet *in_pack) = 0;
 
-	~Kis_DLT_Handler();
-
-	virtual int FetchDLT() { return dlt; }
-	virtual std::string FetchDLTName() { return dlt_name; }
+	virtual int fetch_dlt() { return dlt; }
+	virtual std::string fetch_dlt_name() { return dlt_name; }
 
 protected:
-	GlobalRegistry *globalreg;
 	std::string dlt_name;
 	int dlt;
 	int chainid;
